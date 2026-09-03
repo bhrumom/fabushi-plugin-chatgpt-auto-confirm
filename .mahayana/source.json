@@ -1,0 +1,8 @@
+{
+  "provider": "github",
+  "repository": "bhrumom/fabushi-plugin-chatgpt-auto-confirm",
+  "repositoryId": 1355541260,
+  "defaultBranch": "main",
+  "license": "Proprietary",
+  "subdirectory": "."
+}

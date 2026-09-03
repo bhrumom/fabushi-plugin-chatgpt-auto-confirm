@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "revision": "2026-08-10.1",
+  "autoDispatch": false,
+  "description": "这里的任务不会被小程序自动处理；只有人工把完整任务定义移回 actions-inbox.json 后才会进入队列。",
+  "tasks": [
+    {
+      "id": "mahayana-marketplace-cloudflare-20260730",
+      "state": "todo",
+      "autoDispatch": false,
+      "movedFromQueueAt": "2026-08-10T06:39:37Z",
+      "previousRevision": 22,
+      "previousGoalVersion": 12,
+      "previousStatus": "cancelled",
+      "title": "本地优先生成、双 GitHub 源码托管与分级上线的大乘 MCP Apps 平台",
+      "repository": "bhrumom/fabushi",
+      "connector": "GitHub",
+      "codeDirectory": "fabushi/web",
+      "documentDirectory": ".agents/plugins/plugins/chatgpt-auto-confirm/tasks/mahayana-marketplace-cloudflare-20260730",
+      "resumeFrom": "继续 revision 22 的现有进度，从 T04 用户 GitHub connector、凭证隔离和真实用户 GitHub E2E 开始；保留既有 Chat、邮件线程、分支和已完成证据。",
+      "restoreInstruction": "如需恢复，先检查 todo 状态与现有分支，再把该任务的完整定义移回 actions-inbox.json，递增 revision，并使用 applyMode=next_chat。"
+    }
+  ]
+}

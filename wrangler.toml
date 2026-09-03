@@ -1,0 +1,7 @@
+name = "chatgpt-auto-confirm-mcp"
+main = "worker/src/index.ts"
+compatibility_date = "2026-07-19"
+
+[assets]
+directory = ".mahayana-distribution"
+run_worker_first = ["/mcp", "/mcp/*"]

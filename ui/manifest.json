@@ -1,0 +1,11 @@
+{
+  "name": "ChatGPT 自动确认",
+  "version": "0.1.0",
+  "description": "后台进程间通信自动确认 ChatGPT 工具授权卡片",
+  "permissions": [
+    "mcp.call",
+    "storage.local",
+    "desktop.accessibility",
+    "desktop.chatgpt.approvals"
+  ]
+}

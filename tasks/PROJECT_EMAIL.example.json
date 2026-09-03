@@ -1,0 +1,11 @@
+{
+  "schema": "mahayana.project-email.v1",
+  "recipient": "1315518325@qq.com",
+  "subject": "[立项][TASK_ID] TASK_TITLE",
+  "threadId": null,
+  "messageId": null,
+  "createdAt": null,
+  "lastRound": 0,
+  "lastProgressAt": null,
+  "lastStatus": "pending"
+}

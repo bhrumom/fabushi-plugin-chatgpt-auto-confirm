@@ -1,0 +1,4 @@
+interface:
+  display_name: "一键同步 Action 凭证"
+  short_description: "实时验证并更新 ChatGPT 凭证到 GitHub Secrets"
+  default_prompt: "Use $sync-action-credentials to export the live app:// renderer session from an already-open ChatGPT desktop instance over CDP and update GitHub Actions Secrets without exposing secret values."

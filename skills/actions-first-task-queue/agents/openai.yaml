@@ -1,0 +1,4 @@
+interface:
+  display_name: "Actions 优先任务队列"
+  short_description: "用 Actions 完成重型验证并自动续作等待任务"
+  default_prompt: "Use $actions-first-task-queue to run this task through the Chat queue with GitHub Actions validation."

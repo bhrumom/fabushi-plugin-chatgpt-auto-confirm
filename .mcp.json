@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "chatgpt-auto-confirm-local": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["--experimental-strip-types", "./server/index.mjs"],
+      "cwd": "."
+    },
+    "chatgpt-auto-confirm": {
+      "type": "http",
+      "url": "https://api.ombhrum.com/api/mcp/apps/chatgpt-auto-confirm"
+    }
+  }
+}

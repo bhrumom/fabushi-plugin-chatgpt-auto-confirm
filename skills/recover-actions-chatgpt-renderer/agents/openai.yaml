@@ -1,0 +1,4 @@
+interface:
+  display_name: "修复 Actions ChatGPT 渲染器"
+  short_description: "诊断并修复 Actions ChatGPT 空白页授权卡片与并行渲染器故障"
+  default_prompt: "Use $recover-actions-chatgpt-renderer to diagnose and verify a ChatGPT Actions renderer or authorization-card failure."

@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "supportedPlatforms": ["cli", "desktop"],
+  "runtime": {
+    "cli": {
+      "executable": "./runtime/cli/fabushi-plugin-cli",
+      "args": ["--plugin", "chatgpt-auto-confirm"]
+    },
+    "wasm": {
+      "module": "./runtime/wasm/fabushi_official_miniapps_bg.wasm",
+      "export": "OfficialMiniAppRuntime"
+    }
+  },
+  "miniapp": {
+    "entry": "./ui/index.html",
+    "bridgeVersion": "1.0",
+    "permissions": [
+      "mcp.call",
+      "storage.local",
+      "desktop.accessibility",
+      "desktop.chatgpt.approvals",
+      "browser.in-app.dispatch-and-watch"
+    ]
+  },
+  "commands": [
+    {
+      "name": "start",
+      "tool": "start"
+    },
+    {
+      "name": "stop",
+      "tool": "stop"
+    },
+    {
+      "name": "status",
+      "tool": "status"
+    },
+    {
+      "name": "scan",
+      "tool": "scan_once"
+    },
+    {
+      "name": "audit",
+      "tool": "audit_log"
+    },
+    {
+      "name": "diagnose",
+      "tool": "diagnose"
+    },
+    {
+      "name": "dispatch-goal",
+      "tool": "dispatch_goal"
+    },
+    {
+      "name": "send",
+      "tool": "send_and_watch"
+    },
+    {
+      "name": "add-connector",
+      "tool": "add_connector"
+    },
+    {
+      "name": "reply",
+      "tool": "get_reply"
+    },
+    {
+      "name": "chat-status",
+      "tool": "chat_status"
+    },
+    {
+      "name": "queue-enqueue",
+      "tool": "enqueue_tasks"
+    },
+    {
+      "name": "queue-start",
+      "tool": "start_queue"
+    },
+    {
+      "name": "queue-status",
+      "tool": "queue_status"
+    },
+    {
+      "name": "queue-wait-review",
+      "tool": "wait_for_review"
+    },
+    {
+      "name": "queue-review",
+      "tool": "review_task"
+    },
+    {
+      "name": "queue-pause",
+      "tool": "pause_queue"
+    },
+    {
+      "name": "queue-resume",
+      "tool": "resume_queue"
+    },
+    {
+      "name": "queue-cancel",
+      "tool": "cancel_task"
+    }
+  ],
+  "gates": []
+}

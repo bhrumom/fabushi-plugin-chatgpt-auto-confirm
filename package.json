@@ -1,0 +1,19 @@
+{
+  "name": "@mahayana/chatgpt-auto-confirm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:content": "node scripts/compile-content.mjs",
+    "build:macos": "sh scripts/build-macos-runtime.sh",
+    "start": "node --experimental-strip-types server/index.mjs",
+    "test": "npm run build:content && npm run build:macos && node --experimental-strip-types --test test/*.test.mjs",
+    "deploy": "npm run build:content && npx wrangler deploy"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
