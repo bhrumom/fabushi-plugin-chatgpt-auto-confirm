@@ -414,12 +414,12 @@ func taskSpecSourceList(_ task: AutomationTask) -> String {
 }
 
 let sharedTaskExecutionSkillPath =
-  ".agents/plugins/plugins/chatgpt-auto-confirm/skills/actions-first-task-queue/SKILL.md"
+  "skills/actions-first-task-queue/SKILL.md"
 
 func taskDocumentDirectory(_ task: AutomationTask) -> String {
   guard let first = task.specSources?.first,
         !first.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-    return ".agents/plugins/plugins/chatgpt-auto-confirm/tasks/\(task.id)"
+    return "tasks/\(task.id)"
   }
   return (first as NSString).deletingLastPathComponent
 }
@@ -439,7 +439,7 @@ func refreshAutomationTaskDefinitionFromDisk(_ task: inout AutomationTask) -> Bo
   let relativeControl = task.taskControlPath?.trimmingCharacters(in: .whitespacesAndNewlines)
   let controlPath = (relativeControl?.isEmpty == false)
     ? relativeControl!
-    : ".agents/plugins/plugins/chatgpt-auto-confirm/tasks/actions-inbox.json"
+    : "tasks/actions-inbox.json"
   let controlURL = URL(fileURLWithPath: controlPath, relativeTo: workspaceURL).standardizedFileURL
   guard controlURL.path.hasPrefix(workspaceURL.path + "/"),
         let data = try? Data(contentsOf: controlURL),

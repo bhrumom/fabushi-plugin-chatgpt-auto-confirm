@@ -8,9 +8,10 @@ const runtime = process.env.CHATGPT_AUTO_CONFIRM_NATIVE ||
   fileURLToPath(new URL('../runtime/macos/chatgpt-auto-confirm', import.meta.url));
 const controller = fileURLToPath(new URL('./run-actions-controller.mjs', import.meta.url));
 const resultPath = process.env.ACTION_RESULT_PATH || 'action-result.json';
-const repository = process.env.GITHUB_REPOSITORY || 'bhrumom/fabushi';
+const repository = process.env.CHATGPT_AUTO_CONFIRM_REPOSITORY?.trim() ||
+  process.env.GITHUB_REPOSITORY || 'bhrumom/fabushi';
 const controlPath = process.env.CHATGPT_AUTO_CONFIRM_TASK_CONTROL_PATH ||
-  '.agents/plugins/plugins/chatgpt-auto-confirm/tasks/actions-inbox.json';
+  'tasks/actions-inbox.json';
 const controlRef = process.env.CHATGPT_AUTO_CONFIRM_TASK_CONTROL_REF || 'main';
 const pollSeconds = Math.max(15, Number(
   process.env.CHATGPT_AUTO_CONFIRM_TASK_CONTROL_POLL_SECONDS || 30,
@@ -45,10 +46,10 @@ const native = (command, params = undefined) => {
   return payload;
 };
 
-const fetchRepositoryContent = repositoryPath => {
+const fetchRepositoryContent = (repositoryPath, sourceRepository = repository) => {
   const result = spawnSync('gh', [
     'api', '--method', 'GET',
-    `repos/${repository}/contents/${repositoryPath}`,
+    `repos/${sourceRepository}/contents/${repositoryPath}`,
     '-f', `ref=${controlRef}`,
   ], {
     encoding: 'utf8',
@@ -63,29 +64,31 @@ const fetchRepositoryContent = repositoryPath => {
 };
 
 const fetchControl = () => {
-  const envelope = fetchRepositoryContent(controlPath);
+  const envelope = fetchRepositoryContent(controlPath, repository);
   const raw = Buffer.from(String(envelope.content || '').replace(/\s+/g, ''), 'base64')
     .toString('utf8');
   const control = JSON.parse(raw);
   const directoryCache = new Map();
-  const directoryEntries = directory => {
-    if (!directoryCache.has(directory)) {
-      const entries = fetchRepositoryContent(directory);
+  const directoryEntries = (directory, sourceRepository = repository) => {
+    const cacheKey = `${sourceRepository}:${directory}`;
+    if (!directoryCache.has(cacheKey)) {
+      const entries = fetchRepositoryContent(directory, sourceRepository);
       if (!Array.isArray(entries)) throw new Error(`task document path is not a directory: ${directory}`);
-      directoryCache.set(directory, entries.filter(entry => entry?.type === 'file'));
+      directoryCache.set(cacheKey, entries.filter(entry => entry?.type === 'file'));
     }
-    return directoryCache.get(directory);
+    return directoryCache.get(cacheKey);
   };
   control.tasks = (Array.isArray(control.tasks) ? control.tasks : []).map(task => {
+    const taskSpecRepository = String(task.specRepository || task.repository || repository).trim();
     const documentDirectory = normalizedDirectory(task.documentDirectory);
     const sources = Array.isArray(task.specSources) && task.specSources.length > 0
       ? task.specSources.map(source => String(source || '').replace(/^\/+/, ''))
       : documentDirectory
-        ? directoryEntries(documentDirectory).map(entry => entry.path)
+        ? directoryEntries(documentDirectory, taskSpecRepository).map(entry => entry.path)
         : [];
     const files = sources.map(source => {
       const directory = path.posix.dirname(source);
-      const entry = directoryEntries(directory).find(candidate => candidate.path === source);
+      const entry = directoryEntries(directory, taskSpecRepository).find(candidate => candidate.path === source);
       if (!entry?.sha) throw new Error(`task specification source is missing: ${source}`);
       return { path: source, sha: entry.sha };
     });
@@ -127,15 +130,16 @@ const normalizedDirectory = value => String(value || '')
   .replace(/^\/+|\/+$/g, '');
 
 const taskDocumentBlock = task => {
+  const taskRepository = String(task.specRepository || task.repository || repository).trim();
   const directory = normalizedDirectory(task.documentDirectory);
   if (!directory) {
     return [
       `仓库中尚未登记任务 ${task.id} 的项目目录。先按稳定任务 id 和标题查找匹配项目。`,
-      `如果找不到，创建 .agents/plugins/plugins/chatgpt-auto-confirm/tasks/${task.id}，写入目标/范围、架构、执行任务、验收标准和证据文档，并把文件登记到仓库任务控制项。`,
-      '共享执行技能：.agents/plugins/plugins/chatgpt-auto-confirm/skills/actions-first-task-queue/SKILL.md。每轮重新读取技能和仓库项目文档。',
+      `如果找不到，创建 tasks/${task.id}，写入目标/范围、架构、执行任务、验收标准和证据文档，并把文件登记到仓库任务控制项。`,
+      '共享执行技能：skills/actions-first-task-queue/SKILL.md。每轮重新读取技能和仓库项目文档。',
     ].join('\n');
   }
-  const directoryURL = `https://github.com/${repository}/tree/${controlRef}/${directory}`;
+  const directoryURL = `https://github.com/${taskRepository}/tree/${controlRef}/${directory}`;
   const additionalURLs = Array.isArray(task.documentURLs)
     ? task.documentURLs.map(value => String(value || '').trim()).filter(Boolean)
     : [];
@@ -149,7 +153,7 @@ const taskDocumentBlock = task => {
     '当前 goalVersion 对应的目录资料优先于旧 Chat 中的任务描述。',
     `当前规范摘要：${task._specDigest || 'unavailable'}。`,
     `规范文件：${(task._specFiles || []).join('、') || directory}`,
-    `共享执行技能：.agents/plugins/plugins/chatgpt-auto-confirm/skills/actions-first-task-queue/SKILL.md。每轮重新读取技能和任务目录全部文件。`,
+    `共享执行技能：skills/actions-first-task-queue/SKILL.md。每轮重新读取技能和任务目录全部文件。`,
   ].join('\n');
 };
 

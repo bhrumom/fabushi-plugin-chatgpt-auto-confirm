@@ -29,10 +29,11 @@ const taskRefreshIntervalMs = Math.max(
   Number(process.env.ACTION_TASK_REFRESH_INTERVAL_MS || 60_000),
 );
 const taskInboxPath = process.env.CHATGPT_AUTO_CONFIRM_TASK_INBOX_PATH?.trim() ||
-  '.agents/plugins/plugins/chatgpt-auto-confirm/tasks/actions-inbox.json';
+  'tasks/actions-inbox.json';
 const taskInboxRef = process.env.CHATGPT_AUTO_CONFIRM_TASK_INBOX_REF?.trim() ||
   process.env.GITHUB_REF_NAME?.trim();
-const githubRepository = process.env.GITHUB_REPOSITORY?.trim();
+const githubRepository = process.env.CHATGPT_AUTO_CONFIRM_REPOSITORY?.trim() ||
+  process.env.GITHUB_REPOSITORY?.trim();
 const githubToken = process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim();
 const githubApiUrl = process.env.GITHUB_API_URL?.trim() || 'https://api.github.com';
 const remoteTaskRefreshEnabled = Boolean(
@@ -41,13 +42,13 @@ const remoteTaskRefreshEnabled = Boolean(
 
 const encodeRepoPath = value => value.split('/').map(encodeURIComponent).join('/');
 
-const fetchRepositoryText = async (filePath) => {
+const fetchRepositoryText = async (filePath, sourceRepository = githubRepository) => {
   const normalized = String(filePath || '').trim().replace(/^\/+/, '');
   if (!normalized || normalized.split('/').includes('..')) {
     throw new Error(`Invalid repository task source: ${filePath}`);
   }
   const url =
-    `${githubApiUrl}/repos/${githubRepository}/contents/${encodeRepoPath(normalized)}` +
+    `${githubApiUrl}/repos/${sourceRepository}/contents/${encodeRepoPath(normalized)}` +
     `?ref=${encodeURIComponent(taskInboxRef)}`;
   const response = await fetch(url, {
     headers: {
@@ -95,9 +96,10 @@ const refreshDynamicTaskDefinitions = async () => {
     if (!task?.id) continue;
     const revision = Math.max(1, Number(task.revision || 1));
     const specSources = Array.isArray(task.specSources) ? task.specSources : [];
+    const specRepository = String(task.specRepository || task.repository || githubRepository).trim();
     const specSections = [];
     for (const source of specSources) {
-      const content = (await fetchRepositoryText(source)).trim();
+      const content = (await fetchRepositoryText(source, specRepository)).trim();
       specSections.push(`## ${source}\n${content}`);
     }
     const specSnapshot = specSections.join('\n\n').trim();
