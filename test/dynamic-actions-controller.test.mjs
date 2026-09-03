@@ -6,28 +6,17 @@ const controller = readFileSync(
   new URL('../scripts/run-dynamic-actions-controller.mjs', import.meta.url),
   'utf8',
 );
-const workflow = readFileSync(
-  new URL('../../../../../.github/workflows/chatgpt-auto-confirm-runner.yml', import.meta.url),
-  'utf8',
-);
 const inbox = JSON.parse(readFileSync(
   new URL('../tasks/actions-inbox.json', import.meta.url),
   'utf8',
 ));
 
-test('persistent Actions runner polls the main-branch task control file', () => {
-  assert.match(workflow, /run-dynamic-actions-controller\.mjs/);
-  assert.match(workflow, /CHATGPT_AUTO_CONFIRM_TASK_CONTROL_REF: main/);
-  assert.match(workflow, /CHATGPT_AUTO_CONFIRM_TASK_CONTROL_POLL_SECONDS: "30"/);
-  assert.match(
-    workflow,
-    /inputs\.parallel_queue_smoke && format\('chatgpt-auto-confirm-parallel-smoke-\{0\}-\{1\}'/,
-  );
-  assert.doesNotMatch(workflow, /Import dynamic parallel task inbox/);
-  assert.match(workflow, /Verify dynamic parallel task queue/);
+test('standalone controller polls the main-branch task control file', () => {
   assert.match(controller, /spawnSync\('gh'/);
-  assert.match(controller, /repos\/\$\{repository\}\/contents\/\$\{repositoryPath\}/);
-  assert.match(controller, /fetchRepositoryContent\(controlPath\)/);
+  assert.match(controller, /repos\/\$\{sourceRepository\}\/contents\/\$\{repositoryPath\}/);
+  assert.match(controller, /fetchRepositoryContent\(controlPath, repository\)/);
+  assert.match(controller, /CHATGPT_AUTO_CONFIRM_REPOSITORY/);
+  assert.match(controller, /tasks\/actions-inbox\.json/);
   assert.match(controller, /task\._specDigest/);
   assert.match(controller, /entry\.sha/);
   assert.match(controller, /createHash\('sha256'\)/);
@@ -50,6 +39,7 @@ test('goal versions are idempotent and dependencies use desired runtime ids', ()
   assert.ok(inbox.tasks.every(task => Number.isInteger(task.revision)));
   assert.ok(inbox.tasks.every(task => task.specSources === undefined || Array.isArray(task.specSources)));
   assert.ok(inbox.tasks.every(task => task.repository === 'bhrumom/fabushi'));
+  assert.ok(inbox.tasks.every(task => task.specRepository === undefined || typeof task.specRepository === 'string'));
   assert.ok(inbox.tasks.every(task => typeof task.codeDirectory === 'string'));
 });
 
@@ -118,7 +108,7 @@ test('missing task projects are created in the repository and document bodies st
   assert.match(controller, /只在消息中提供目录路径和文件夹链接/);
   assert.match(controller, /仓库中尚未登记任务/);
   assert.match(controller, /写入目标\/范围、架构、执行任务、验收标准和证据文档/);
-  assert.match(controller, /documentDirectory[\s\S]*\? directoryEntries\(documentDirectory\)[\s\S]*: \[\]/);
+  assert.match(controller, /documentDirectory[\s\S]*\? directoryEntries\(documentDirectory, taskSpecRepository\)[\s\S]*: \[\]/);
   assert.doesNotMatch(controller, /specificationFiles|specificationURLs/);
   assert.doesNotMatch(controller, /documentDirectory_and_codeDirectory_are_required/);
 });

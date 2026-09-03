@@ -55,11 +55,6 @@ const nativeSource = readdirSync(nativeDirectory)
   .sort()
   .map(name => readFileSync(new URL(name, nativeDirectory), 'utf8'))
   .join('\n');
-const runnerWorkflowSource = readFileSync(
-  new URL('../../../../../.github/workflows/chatgpt-auto-confirm-runner.yml', import.meta.url),
-  'utf8',
-);
-
 const call = async (name, args = {}) => {
   const response = await worker.fetch(new Request('https://example.test/mcp', {
     method: 'POST', body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call',
@@ -735,7 +730,6 @@ test('task queue tools preserve dependencies, resource locks, review gate and co
   assert.match(nativeSource, /dedicated-visible-renderer-wake/);
   assert.match(nativeSource, /blankNavigationCount < 3/);
   assert.match(nativeSource, /queueTargetStateIsUsableForQueue/);
-  assert.match(runnerWorkflowSource, /CHATGPT_AUTO_CONFIRM_HEADLESS: "1"/);
   assert.match(nativeSource, /stage=dedicated-process-hidden/);
   assert.match(nativeSource, /parallelDedicatedProcessQueueWorkerMode/);
   assert.match(nativeSource, /CHATGPT_AUTO_CONFIRM_PROFILE_PATH/);

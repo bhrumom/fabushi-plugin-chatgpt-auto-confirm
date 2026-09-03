@@ -6,10 +6,6 @@ import { HOME, RESOURCES } from '../worker/src/content.generated.ts';
 
 const plugin = JSON.parse(readFileSync(new URL('../.codex-plugin/plugin.json', import.meta.url), 'utf8'));
 const mcpConfig = JSON.parse(readFileSync(new URL('../.mcp.json', import.meta.url), 'utf8'));
-const actionsWorkflow = readFileSync(
-  new URL('../../../../../.github/workflows/chatgpt-auto-confirm-runner.yml', import.meta.url),
-  'utf8',
-);
 const restoreSessionScript = readFileSync(
   new URL('../scripts/restore-session-cookies.mjs', import.meta.url),
   'utf8',
@@ -28,10 +24,6 @@ const liveSessionExporter = readFileSync(
 );
 const credentialBundle = readFileSync(
   new URL('../scripts/credential-bundle.mjs', import.meta.url),
-  'utf8',
-);
-const keepaliveWorkflow = readFileSync(
-  new URL('../../../../../.github/workflows/chatgpt-auto-confirm-keepalive.yml', import.meta.url),
   'utf8',
 );
 const dynamicController = readFileSync(
@@ -98,40 +90,14 @@ test('renderer recovery skill is packaged with the miniapp', () => {
   assert.match(rendererRecoveryMetadata, /\$recover-actions-chatgpt-renderer/);
 });
 test('article bodies stay lazy', () => assert.ok(Object.keys(RESOURCES).length >= 1));
-test('continuous Actions runner preserves secrets and chains incomplete sessions', () => {
-  assert.match(actionsWorkflow, /runs-on: macos-15/);
-  assert.match(actionsWorkflow, /timeout-minutes: 355/);
-  assert.match(actionsWorkflow, /CHATGPT_CODEX_AUTH_B64/);
-  assert.match(actionsWorkflow, /CHATGPT_SESSION_COOKIES_B64/);
+test('standalone runtime preserves authenticated task control contracts', () => {
   assert.match(syncCredentialSkill, /Codex 凭证与 ChatGPT Session.*独立且都必需/);
   assert.match(syncCredentialSkill, /Work → Chat/);
   assert.match(syncCredentialSkill, /不得把 Work usage 页面当作 Chat 页面/);
-  assert.match(actionsWorkflow, /restore-session-cookies\.mjs/);
-  assert.match(actionsWorkflow, /CHATGPT_SESSION_MODE=restore-and-verify/);
-  assert.match(actionsWorkflow, /Verify authenticated ChatGPT session/);
-  assert.match(actionsWorkflow, /verify_chatgpt_login/);
-  assert.match(
-    actionsWorkflow,
-    /Verify authenticated ChatGPT session\r?\n\s+if: \$\{\{ inputs\.cancel_task_id == '' \}\}\r?\n\s+id: auth_verify\r?\n\s+timeout-minutes: 6/,
-  );
-  assert.match(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_STATE: \$\{\{ steps\.paths\.outputs\.state_path \}\}/);
-  assert.match(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_QUEUE_STATE: \$\{\{ steps\.paths\.outputs\.state_path \}\}/);
-  assert.match(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_BACKGROUND_PORT: \$\{\{ env\.CHATGPT_CDP_PORT \}\}/);
-  assert.match(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_PROFILE_PATH: \$\{\{ steps\.paths\.outputs\.profile_dir \}\}/);
-  assert.match(actionsWorkflow, /AUTHENTICATION_VERIFIED/);
-  assert.match(actionsWorkflow, /no continuation was dispatched/);
-  assert.match(actionsWorkflow, /for attempt in 1 2/);
-  assert.match(actionsWorkflow, /Authenticated Chat shell attempt/);
-  assert.match(actionsWorkflow, /restarting the app before retrying/);
-  assert.match(actionsWorkflow, /pkill -f "user-data-dir=\$PROFILE_DIR"/);
-  assert.match(actionsWorkflow, /SingletonLock/);
-  assert.match(actionsWorkflow, /detach_mount\(\)/);
-  assert.match(actionsWorkflow, /for attempt in 1 2 3 4 5/);
-  assert.match(actionsWorkflow, /hdiutil detach "\$mount_dir"/);
-  assert.match(actionsWorkflow, /hdiutil detach "\$mount_dir" -force/);
-  assert.doesNotMatch(actionsWorkflow, /hdiutil detach "\$mount_dir" .* -wait/);
-  assert.match(actionsWorkflow, /hdiutil info/);
-  assert.match(actionsWorkflow, /trap cleanup_mount EXIT/);
+  assert.match(dynamicController, /CHATGPT_AUTO_CONFIRM_REPOSITORY/);
+  assert.match(dynamicController, /tasks\/actions-inbox\.json/);
+  assert.match(nativeSource, /skills\/actions-first-task-queue\/SKILL\.md/);
+  assert.match(nativeSource, /tasks\/actions-inbox\.json/);
   assert.match(restoreSessionScript, /mode === 'restore'/);
   assert.match(restoreSessionScript, /process\.exit\(0\)/);
   assert.match(restoreSessionScript, /Page\.reload/);
@@ -154,52 +120,6 @@ test('continuous Actions runner preserves secrets and chains incomplete sessions
     /state\.currentMode\s*\|\|\s*state\.workComposer\s*\|\|\s*state\.hasChat\s*\|\|\s*state\.hasWork/,
   );
   assert.doesNotMatch(restoreSessionScript, /call\([^\n]*['"]Page\.setWebLifecycleState['"]/);
-  assert.doesNotMatch(actionsWorkflow, /pkill -x ChatGPT/);
-  assert.match(actionsWorkflow, /Launch authenticated desktop shell/);
-  assert.match(
-    actionsWorkflow,
-    /Launch authenticated desktop shell\r?\n\s+if: \$\{\{ inputs\.cancel_task_id == '' \}\}\r?\n\s+timeout-minutes: 6/,
-  );
-  assert.doesNotMatch(actionsWorkflow, /login_status=\$\(/);
-  assert.match(actionsWorkflow, /Build native queue runtime/);
-  assert.match(actionsWorkflow, /native-auth-verify\.log/);
-  assert.match(actionsWorkflow, /native-auth-targets\.json/);
-  assert.match(actionsWorkflow, /Native ChatGPT authentication verification failed/);
-  assert.match(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_STATE_KEY/);
-  assert.doesNotMatch(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_INITIAL_STATE_B64/);
-  assert.match(actionsWorkflow, /\{"automationTasks":\[\]\}/);
-  assert.match(actionsWorkflow, /queue-state\.enc/);
-  assert.match(actionsWorkflow, /previous_run_id="\$GITHUB_RUN_ID"/);
-  assert.match(actionsWorkflow, /parallel_queue_smoke/);
-  assert.match(actionsWorkflow, /cancel_task_id/);
-  assert.match(actionsWorkflow, /Cancel persisted task without launching Chat/);
-  assert.match(actionsWorkflow, /cancel-persisted-task\.mjs/);
-  assert.match(actionsWorkflow, /Persisted task cancellation completed/);
-  assert.match(actionsWorkflow, /inputs\.cancel_task_id == ''/);
-  assert.match(actionsWorkflow, /chatgpt-auto-confirm-parallel-smoke/);
-  assert.match(actionsWorkflow, /verify-parallel-actions-queue\.mjs/);
-  assert.match(actionsWorkflow, /parallel-queue-evidence\.json/);
-  assert.match(actionsWorkflow, /task-queue\/watcher-trace\.log/);
-  assert.doesNotMatch(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_TASK_INBOX_B64/);
-  assert.doesNotMatch(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_TASK_INBOX_FILE/);
-  assert.match(actionsWorkflow, /CHATGPT_AUTO_CONFIRM_TASK_CONTROL_PATH/);
-  assert.match(actionsWorkflow, /tasks\/actions-inbox\.json/);
-  assert.doesNotMatch(actionsWorkflow, /import-actions-task-inbox\.mjs/);
-  assert.match(actionsWorkflow, /status" != "incomplete"/);
-  assert.match(actionsWorkflow, /VERIFICATION_ONLY/);
-  assert.match(actionsWorkflow, /no continuation was dispatched/);
-  assert.match(actionsWorkflow, /--ref "\$GITHUB_REF_NAME"/);
-  assert.match(actionsWorkflow, /jq '\{status, reason, counts, tasks\}'/);
-  assert.doesNotMatch(actionsWorkflow, /pull_request:/);
-  assert.doesNotMatch(actionsWorkflow, /push:/);
-  assert.match(actionsWorkflow, /account_id:/);
-  assert.match(actionsWorkflow, /chatgpt-auto-confirm-credentials-/);
-  assert.match(actionsWorkflow, /aes-256-gcm/);
-  assert.match(actionsWorkflow, /retention-days: 30/);
-  assert.match(actionsWorkflow, /restore_latest_credentials/);
-  assert.match(keepaliveWorkflow, /cron: '17 \*\/6 \* \* \*'/);
-  assert.match(keepaliveWorkflow, /CHATGPT_AUTO_CONFIRM_ACCOUNT_IDS_JSON/);
-  assert.match(keepaliveWorkflow, /smoke_only=true/);
 });
 test('login sync uploads both credential forms without printing values', () => {
   assert.match(dispatchActionsScript, /CHATGPT_SESSION_COOKIES_PATH/);
