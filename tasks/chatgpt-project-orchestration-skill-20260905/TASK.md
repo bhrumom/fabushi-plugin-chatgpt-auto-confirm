@@ -5,8 +5,8 @@
 - **Status:** in-progress
 - **Started:** 2026-09-05
 - **Branch:** `codex/chatgpt-project-orchestration-skill`
-- **Commit:** pending
-- **PR:** pending
+- **Commit:** `31f130a` initial implementation; review-fix commit is the current PR head
+- **PR:** [#1](https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/pull/1)
 
 ## Objective
 
@@ -42,8 +42,8 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Local lightweight: skill validator, focused contract test (10/10), and
   `git diff --check`.
-- Remote: plugin runtime Actions build/test/evidence upload, protected merge,
-  and canonical `main` readback.
+- Remote: PR validation workflow added for the exact PR head; plugin runtime Actions
+  build/test/evidence upload, protected merge, and canonical `main` readback remain pending.
 - No local application build, packaging, device, or E2E run is permitted.
 
 ## Implementation summary
@@ -54,7 +54,15 @@ The contract test also corrected two stale repository-local assertions: the nati
 task-inbox path belongs to `native/QueueState.swift`, and empty prompt prefixes are
 an array contract rather than a newline-joined string. No application build was run.
 
+## Review feedback applied
+
+- Save only a redacted canonical requirement snapshot.
+- Bind review approval to repository, PR, head SHA, base SHA, task ID, and spec digest.
+- Add independent A00-A15 task records and correct the A09/A15 dependency waves.
+- Make the Stop Answering retry prohibition explicit and expand contract coverage.
+- Add exact-PR-head macOS runtime/contract validation in `.github/workflows/pull-request-validation.yml`.
+
 ## Next action
 
-Run lightweight checks, commit named files, open the plugin-repository PR, and
-wait for its Actions/merge-queue result.
+Push the review fixes, wait for exact-head Actions, obtain a fresh code-review verdict,
+then use the protected merge queue and read back canonical `main`.

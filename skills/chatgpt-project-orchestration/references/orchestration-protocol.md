@@ -20,7 +20,10 @@ stage            = PLANNED | EXECUTING | REVIEW | TEST_RELEASE |
                    VIDEO_REVIEW | FORMAL_RELEASE | COMPLETE | BLOCKED
 group_tabs       = architecture, execution, review, test-release, formal-release
 atomic_tasks     = [{ task_id, task_path, owner_chat, status, branch, pr, head_sha }]
-accepted_head    = exact protected-main SHA, once available
+reviewed_pr_head_sha = exact reviewed PR head SHA, invalidated by any review-key change
+accepted_main_sha    = exact protected-main SHA, once available
+architecture_revision = immutable architecture revision
+spec_digest      = digest of the canonical task/spec snapshot
 evidence         = [screenshots, video, trace, reports, logs, run IDs]
 next_action      = one concrete action
 max_parallel_execution = runtime capability, not a hard-coded value in the Skill
@@ -65,7 +68,8 @@ action. Do not claim completion while the generation stop control is visible.
 ```
 
 发送器必须记录 `connectorConfirmed`, `inputConfirmed`, `messageConfirmed` 和 `sent`
-等发送验证结果；缺少消息气泡确认时不得开始回答超时计时。
+等发送验证结果；缺少消息气泡确认时不得开始回答超时计时。用户要求或上下文若尚未
+落盘，先做 redaction/secret scan，只持久化脱敏后的 canonical requirement snapshot。
 
 ### 2.1 可恢复状态机
 
@@ -133,14 +137,23 @@ Blocked by: exact condition, if any
 
 ## 5. 代码审查组精确 head 门禁
 
-审查消息必须列出 PR 编号、base、声明的 head SHA 和仓库。审查组随后：
+审查消息必须列出 PR 编号、实际 base SHA、声明的 head SHA、任务 ID、spec digest 和
+仓库。审查组计算并锁定：
+
+```text
+review_key = SHA256(repository + pr_number + head_sha + base_sha
+                    + atomic_task_id + spec_digest)
+```
+
+`review_key` 的任意组成部分变化都会使原批准失效；`base` 不能只记录分支名。
+审查组随后：
 
 1. 从 GitHub 获取 PR 实际 head、changed files、review/CI 状态和项目任务记录。
 2. 检查实现是否只完成任务范围，是否有安全/并发/错误处理/回滚/许可证问题，测试
    是否验证了真实边界，项目记录是否可重建。
 3. 把每一条问题写到审查记录，标注阻塞级别、文件/行和修复验收方式。
-4. 通过时写出 `REVIEW-PASS`，同时锁定被审查的 PR/head；若 head 变化，审查失效，
-   必须重新审查。
+4. 通过时写出 `REVIEW-PASS`，同时锁定被审查的 `review_key`；若 PR、head、base、
+   task revision 或 spec digest 任一变化，审查失效，必须重新审查。
 
 审查组不得自行偷偷改产品代码来消除问题。需要改动时退回执行组；若只需补充审查
 记录，可在审查组自己的记录变更中完成并保留关联提交。
@@ -159,6 +172,7 @@ screenshots[]      # step-labelled meaningful checkpoints
 operation_video[]  # complete journey, segmented only with coverage continuity
 trace, test_report, platform_logs, result
 retention_days, upload_if, next_action
+artifact_digest, producer, source_sha, redaction_scan_result
 ```
 
 截图应按动作标注，例如 `01-startup`, `02-login`, `03-navigation`, `04-search`,
@@ -189,8 +203,9 @@ retention_days, upload_if, next_action
 - 每条 Chat 结束前都要把工作状态写回仓库；不要把“我记得上次说过”作为续接依据。
 - 上下文过长或需要新会话时，在当前 group tab 内创建 fresh Chat，发送持久化摘要、
   未完成原子任务、已接受提交、外部运行 ID 和精确下一步。旧 Chat 保留为只读证据。
-- 生成期间 Stop Answering 控件仍存在时，不得发送续接、停止回答、关闭页面或切换
-  项目组。若 transport 报告失败，先记录诊断并按控制器的有限重试策略处理。
+- 生成期间 Stop Answering 控件仍存在时，不得读取结果、发送续接或任何新消息、创建
+  fresh Chat、关闭页面/标签页或切换项目组。若 transport 报告失败，RUNNING 状态下的
+  retry 只能做非破坏性观察或重连，仍不得 read-result、send、new Chat、close 或 switch。
 - 任何外部 CI、部署、发布等待都保持 `in-progress`；不要把超时、空回答、工具活动
   行或折叠思考区当成成功。
 
