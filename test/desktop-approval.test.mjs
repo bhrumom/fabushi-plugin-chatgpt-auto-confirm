@@ -747,6 +747,9 @@ test('task queue tools preserve dependencies, resource locks, review gate and co
   assert.match(nativeSource, /dispatchPointerClick\(modeSwitch\)/);
   assert.match(nativeSource, /new PointerEvent\('pointerdown'/);
   assert.match(nativeSource, /const isChatLabel = label => label === 'chat'/);
+  assert.match(nativeSource, /const explicitChatTab = modeTabs\(\)/);
+  assert.match(nativeSource, /surface\.workComposer && explicitChatTab/);
+  assert.match(nativeSource, /hidden sender never reaches the Chat surface/);
   assert.match(nativeSource, /persisted-atom-update/);
   assert.match(nativeSource, /home-composer-mode-v1/);
   assert.match(nativeSource, /force-persisted-mode/);

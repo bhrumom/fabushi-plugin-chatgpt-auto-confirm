@@ -1217,6 +1217,38 @@ func clickChatJS() -> String {
         modeControls
       };
     }
+    // Current desktop builds expose an explicit top-level Chat/Work toggle.
+    // The shell can still expose a stale "current mode: ChatGPT" trigger while
+    // the composer belongs to Work. Prefer the real, unselected Chat tab before
+    // considering the compact-mode trigger or a Work-side "new conversation"
+    // button; otherwise the latter only creates another Work task and the
+    // hidden sender never reaches the Chat surface.
+    const explicitChatTab = modeTabs()
+      .filter(candidate => labelsFor(candidate).some(label => isChatLabel(label)))
+      .filter(candidate => !isSelected(candidate))
+      .filter(candidate => {
+        const role = normalize(candidate.getAttribute('role'));
+        return ['BUTTON', 'A'].includes(candidate.tagName)
+          || ['button', 'tab', 'menuitem', 'menuitemradio', 'option'].includes(role);
+      })
+      .sort((lhs, rhs) => modeTabScore(rhs) - modeTabScore(lhs))[0];
+    if (surface.workComposer && explicitChatTab) {
+      const rect = explicitChatTab.getBoundingClientRect();
+      setTimeout(() => {
+        try { dispatchPointerClick(explicitChatTab); } catch (_) {}
+      }, 0);
+      return {
+        ok: true,
+        chatSelected: true,
+        dispatchOnly: true,
+        nativeClickRecommended: true,
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        selectedLabel: labelsFor(explicitChatTab)[0] || 'chat',
+        surface,
+        modeControls
+      };
+    }
     const currentChatGPTMode = candidates().find(candidate =>
       labelsFor(candidate).some(label =>
         label.includes('current mode: chatgpt')

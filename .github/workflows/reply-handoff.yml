@@ -28,3 +28,25 @@ jobs:
           name: reply-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}
           path: reply-handoff.tap
           retention-days: 90
+
+  macos-runtime-compile:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Compile the CDP runtime on the hosted macOS runner
+        run: |
+          xcrun swiftc -O \
+            -framework ApplicationServices \
+            -framework AppKit \
+            -framework Security \
+            -framework SystemConfiguration \
+            native/*.swift \
+            -o chatgpt-auto-confirm
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-cdp-runtime-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}
+          path: chatgpt-auto-confirm
+          retention-days: 90
