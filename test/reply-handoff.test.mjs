@@ -105,3 +105,22 @@ test('registration requires real independent bridge, owned task and immutable wa
   f.bridge.independentLifetime = false;
   await assert.rejects(f.controller.register(f.request), /bridge_unavailable/);
 });
+
+test('real loopback host rejects registration without independent Work bridge', async () => {
+  const { createInAppBrowserCapabilityHost } = await import('../scripts/in-app-browser-capability-host.mjs');
+  const directory = await mkdtemp(join(tmpdir(), 'handoff-host-'));
+  const host = await createInAppBrowserCapabilityHost({ browser: {}, tab: { playwright: {} },
+    startUrl: 'https://chatgpt.com/', capabilityFile: join(directory, 'capability.json'),
+    jobStateFile: join(directory, 'jobs.json') });
+  try {
+    const headers = { authorization: `Bearer ${host.token}`, 'content-type': 'application/json' };
+    const unauthorized = await fetch(`${host.baseUrl}/v1/reply-handoff`, { method: 'POST', body: '{}' });
+    assert.equal(unauthorized.status, 401);
+    const status = await (await fetch(`${host.baseUrl}/v1/capability`, { headers })).json();
+    assert.equal(status.replyHandoffAvailable, false);
+    const rejected = await fetch(`${host.baseUrl}/v1/reply-handoff`, { headers, method: 'POST',
+      body: JSON.stringify({ action: 'register', watchId: 'watch-1' }) });
+    assert.equal(rejected.status, 503);
+    assert.equal((await rejected.json()).errorCode, 'independent_work_bridge_unavailable');
+  } finally { await host.release(); }
+});

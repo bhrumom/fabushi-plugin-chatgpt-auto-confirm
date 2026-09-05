@@ -7,6 +7,14 @@ export const digest = text => createHash('sha256').update(String(text)).digest('
 const idPattern = /^[a-zA-Z0-9_-]{1,128}$/u;
 const hashPattern = /^[a-f0-9]{64}$/u;
 const terminal = new Set(['delivered', 'cancelled', 'superseded']);
+async function bounded(action) {
+  let timer;
+  try {
+    return await Promise.race([Promise.resolve().then(action), new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('host_timeout')), 10_000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 // No model call happens here. The owning desktop host must keep these callbacks
 // alive independently of an agent turn, and deduplicate send() by eventId.
@@ -80,14 +88,15 @@ export class ReplyHandoff {
         if (Object.keys(binding).some(key => binding[key] !== previous[key])) throw new Error('watch_identity_conflict');
         return this.status(input.watchId);
       }
-      if (!await this.bridge.ownsTask(input.threadId)) throw new Error('work_task_not_owned');
+      if (!await bounded(() => this.bridge.ownsTask(input.threadId))) throw new Error('work_task_not_owned');
       if ([...this.watches.values()].some(w => !terminal.has(w.status) && w.tabId === input.tabId)) {
         throw new Error('tab_already_watched');
       }
       if (this.watches.size >= 1000) throw new Error('handoff_capacity_reached');
       this.watches.set(input.watchId, { ...binding, status: 'waiting', candidate: null,
         eventId: null, retryAt: 0, attempts: 0, diagnostic: null });
-      await this.save();
+      try { await this.save(); }
+      catch (error) { this.watches.delete(input.watchId); throw error; }
       return this.status(input.watchId);
     });
   }
@@ -115,8 +124,8 @@ export class ReplyHandoff {
       for (const watch of this.watches.values()) {
         if (terminal.has(watch.status) || watch.retryAt > this.now()) continue;
         try {
-          if (!await this.bridge.ownsTask(watch.threadId)) throw new Error('work_task_not_owned');
-          const state = await this.readSnapshot(watch);
+          if (!await bounded(() => this.bridge.ownsTask(watch.threadId))) throw new Error('work_task_not_owned');
+          const state = await bounded(() => this.readSnapshot(watch));
           if (state.url !== watch.conversationUrl || state.hasComposer !== true
               || state.hasWorkComposer === true) throw new Error('conversation_unavailable');
           if (!state.latestUserText?.trim()) throw new Error('user_turn_unavailable');
@@ -153,9 +162,9 @@ export class ReplyHandoff {
           watch.eventId ||= `reply_${digest(watch.watchId + ':' + watch.threadId)}`;
           watch.status = 'pending';
           await this.save();
-          const receipt = await this.bridge.send({ eventId: watch.eventId, threadId: watch.threadId,
+          const receipt = await bounded(() => this.bridge.send({ eventId: watch.eventId, threadId: watch.threadId,
             ...LOCAL_EXECUTOR,
-            prompt: `网页版本轮回复已结束。请读取 ${watch.conversationUrl} 的完整回复，核对项目记录后继续执行和派发。回答结束不代表任务已完成。事件：${watch.eventId}` });
+            prompt: `网页版本轮回复已结束。请读取 ${watch.conversationUrl} 的完整回复，核对项目记录后继续执行和派发。回答结束不代表任务已完成。事件：${watch.eventId}` }));
           if (receipt?.accepted !== true || receipt.eventId !== watch.eventId) throw new Error('wake_not_acknowledged');
           watch.status = 'delivered';
           watch.diagnostic = null;

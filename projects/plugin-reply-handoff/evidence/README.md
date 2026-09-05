@@ -8,3 +8,12 @@
   observer or Work delivery adapter is exposed. No raw app protocol attempted.
 - git diff --check: passed before submission.
 - Actions / release / real E2E: pending. Mock tests are not real E2E evidence.
+
+## Local verification requested by user
+
+- Node v26.7.0: focused suite 44/44 passed, [report](local-tests.tap).
+- Actual local loopback HTTP test: missing authorization → 401; missing independent Work bridge → 503, not a successful registration. Browser itself is mocked in that test.
+- Actual machine readiness probe: capability_descriptor_absent.
+- Initial CI: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/actions/runs/33946773891 passed for e38714c9bfaa0eb6a01434c7a60e95d039935f11.
+- Draft PR: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/pull/2.
+- No real web-to-Work wake or scoped auto-confirmation claimed.
