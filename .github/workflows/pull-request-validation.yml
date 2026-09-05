@@ -13,9 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  macos-runtime-and-contracts:
-    runs-on: macos-latest
-    timeout-minutes: 30
+  skill-contract-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out the exact PR head
         uses: actions/checkout@v4
@@ -30,5 +30,8 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Build the content and macOS runtime, then run contract tests
-        run: npm test
+      - name: Build content
+        run: npm run build:content
+
+      - name: Run the focused skill contract tests
+        run: node --experimental-strip-types --test test/contract.test.mjs

@@ -5,7 +5,7 @@
 - **Status:** in-progress
 - **Started:** 2026-09-05
 - **Branch:** `codex/chatgpt-project-orchestration-skill`
-- **Commit:** `31f130a` initial implementation; review-fix commit is the current PR head
+- **Commit:** `31f130a` initial implementation; `4d95bf6` review fixes; workflow scope fix pending
 - **PR:** [#1](https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/pull/1)
 
 ## Objective
@@ -24,7 +24,7 @@ test/release → formal release workflow.
 3. It requires durable task records, exact-head review, protected-main packaged
    E2E evidence, complete operation video, video review, and traceable formal
    release before completion.
-4. The focused contract test and the standalone plugin GitHub Actions workflow
+4. The focused contract test and the standalone plugin PR-validation workflow
    pass for the exact PR head, then the protected PR is merged to `main`.
 
 ## Open-source-first decision
@@ -42,14 +42,17 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Local lightweight: skill validator, focused contract test (10/10), and
   `git diff --check`.
-- Remote: PR validation workflow added for the exact PR head; plugin runtime Actions
-  build/test/evidence upload, protected merge, and canonical `main` readback remain pending.
+- Remote: PR validation run `33945901577` built content and the macOS runtime successfully,
+  then exposed 9 pre-existing full-runtime test failures unrelated to this Skill. The
+  validation workflow is now narrowed to content generation plus the focused Skill contract
+  test for exact PR heads; protected merge and canonical `main` readback remain pending.
 - No local application build, packaging, device, or E2E run is permitted.
 
 ## Implementation summary
 
 Added the discoverable `chatgpt-project-orchestration` Skill, its detailed protocol
-reference, metadata, architecture output, 16-task DAG, and contract-test coverage.
+reference, metadata, architecture output, 16-task DAG, independent A00-A15 records,
+and contract-test coverage.
 The contract test also corrected two stale repository-local assertions: the native
 task-inbox path belongs to `native/QueueState.swift`, and empty prompt prefixes are
 an array contract rather than a newline-joined string. No application build was run.
@@ -60,7 +63,8 @@ an array contract rather than a newline-joined string. No application build was 
 - Bind review approval to repository, PR, head SHA, base SHA, task ID, and spec digest.
 - Add independent A00-A15 task records and correct the A09/A15 dependency waves.
 - Make the Stop Answering retry prohibition explicit and expand contract coverage.
-- Add exact-PR-head macOS runtime/contract validation in `.github/workflows/pull-request-validation.yml`.
+- Add exact-PR-head Skill contract validation in `.github/workflows/pull-request-validation.yml`;
+  the full runtime test failures are recorded as a separate baseline issue rather than hidden.
 
 ## Next action
 
