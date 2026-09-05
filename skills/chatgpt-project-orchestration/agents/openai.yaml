@@ -1,0 +1,4 @@
+interface:
+  display_name: "ChatGPT 项目组编排"
+  short_description: "按架构、执行、审查、测试和发布门禁协同 ChatGPT"
+  default_prompt: "Use $chatgpt-project-orchestration to coordinate a Chat-mode ChatGPT project team: persist the architecture and atomic tasks, run one same-tab execution conversation per task, review exact PR heads, collect packaged E2E screenshots/video/traces, and release only after every gate passes."
