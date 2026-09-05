@@ -1,6 +1,6 @@
 # Plugin reply-to-Work handoff
 
-Standalone plugin workstream `PRH`, task `PRH-001`, **in-progress / host integration blocked**.
+Standalone plugin workstream `PRH`, task `PRH-001`, **in-progress / local adapter implemented; signed-in E2E pending**.
 Authoritative repository: `bhrumom/fabushi-plugin-chatgpt-auto-confirm`.
 This is not a Fabushi app project and allocates no FAB-P number. The Fabushi main
 portfolio was read on 2026-09-05; the prior conversation explicitly corrected the

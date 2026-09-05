@@ -26,6 +26,8 @@
   in `tools/list`.
 - Initial CI: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/actions/runs/33946773891 passed for e38714c9bfaa0eb6a01434c7a60e95d039935f11.
 - Draft PR: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/pull/2.
+- Current branch commit: `b3cf3b5d9685e2ddf33defa1a8b830b76a4102a6`.
+- Follow-up CI: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/actions/runs/33948958618 (passed).
 - No real web-to-Work wake or scoped auto-confirmation is claimed until the
   signed-in host E2E is run. The bridge contract suite covers ownership,
   Luna/medium argv enforcement and event-ledger deduplication.
