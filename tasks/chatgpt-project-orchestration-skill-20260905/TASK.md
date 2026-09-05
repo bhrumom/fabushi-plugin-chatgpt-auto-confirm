@@ -5,7 +5,7 @@
 - **Status:** in-progress
 - **Started:** 2026-09-05
 - **Branch:** `codex/chatgpt-project-orchestration-skill`
-- **Commit:** `31f130a` initial implementation; `4d95bf6` review fixes; workflow scope fix pending
+- **Commits:** `31f130a` initial implementation; `4d95bf6` review fixes; `ca1b356` exact-head workflow scope fix
 - **PR:** [#1](https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/pull/1)
 
 ## Objective
@@ -42,10 +42,11 @@ are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Local lightweight: skill validator, focused contract test (10/10), and
   `git diff --check`.
-- Remote: PR validation run `33945901577` built content and the macOS runtime successfully,
+- Remote: full-runtime diagnostic run `33945901577` built content and the macOS runtime successfully,
   then exposed 9 pre-existing full-runtime test failures unrelated to this Skill. The
   validation workflow is now narrowed to content generation plus the focused Skill contract
-  test for exact PR heads; protected merge and canonical `main` readback remain pending.
+  test for exact PR heads at current head `ca1b356`; protected merge and canonical `main`
+  readback remain pending.
 - No local application build, packaging, device, or E2E run is permitted.
 
 ## Implementation summary
@@ -68,5 +69,5 @@ an array contract rather than a newline-joined string. No application build was 
 
 ## Next action
 
-Push the review fixes, wait for exact-head Actions, obtain a fresh code-review verdict,
+Push the review fixes and exact-head workflow scope, wait for exact-head Actions, obtain a fresh code-review verdict,
 then use the protected merge queue and read back canonical `main`.
