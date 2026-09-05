@@ -38,6 +38,10 @@ const nativeSource = readFileSync(
   new URL('../native/main.swift', import.meta.url),
   'utf8',
 );
+const nativeQueueState = readFileSync(
+  new URL('../native/QueueState.swift', import.meta.url),
+  'utf8',
+);
 const workerSource = readFileSync(
   new URL('../worker/src/index.ts', import.meta.url),
   'utf8',
@@ -60,6 +64,18 @@ const rendererRecoveryMetadata = readFileSync(
 );
 const syncCredentialSkill = readFileSync(
   new URL('../skills/sync-action-credentials/SKILL.md', import.meta.url),
+  'utf8',
+);
+const projectOrchestrationSkill = readFileSync(
+  new URL('../skills/chatgpt-project-orchestration/SKILL.md', import.meta.url),
+  'utf8',
+);
+const projectOrchestrationReference = readFileSync(
+  new URL('../skills/chatgpt-project-orchestration/references/orchestration-protocol.md', import.meta.url),
+  'utf8',
+);
+const projectOrchestrationMetadata = readFileSync(
+  new URL('../skills/chatgpt-project-orchestration/agents/openai.yaml', import.meta.url),
   'utf8',
 );
 
@@ -89,6 +105,19 @@ test('renderer recovery skill is packaged with the miniapp', () => {
   assert.match(rendererRecoveryMetadata, /display_name:/);
   assert.match(rendererRecoveryMetadata, /\$recover-actions-chatgpt-renderer/);
 });
+test('project orchestration skill is packaged with the miniapp', () => {
+  assert.equal(plugin.skills, './skills');
+  assert.match(projectOrchestrationSkill, /name: chatgpt-project-orchestration/);
+  assert.match(projectOrchestrationSkill, /聊天\/Chat/);
+  assert.match(projectOrchestrationSkill, /停止回答\/Stop answering/);
+  assert.match(projectOrchestrationSkill, /一个 ChatGPT 浏览器标签页/);
+  assert.match(projectOrchestrationSkill, /TEST_RELEASE → VIDEO_REVIEW → FORMAL_RELEASE/);
+  assert.match(projectOrchestrationReference, /PROJECT_TEAM_REPORT_V1/);
+  assert.match(projectOrchestrationReference, /screenshots\[\]/);
+  assert.match(projectOrchestrationReference, /exact protected-main SHA|精确 main SHA/);
+  assert.match(projectOrchestrationMetadata, /display_name:/);
+  assert.match(projectOrchestrationMetadata, /\$chatgpt-project-orchestration/);
+});
 test('article bodies stay lazy', () => assert.ok(Object.keys(RESOURCES).length >= 1));
 test('standalone runtime preserves authenticated task control contracts', () => {
   assert.match(syncCredentialSkill, /Codex 凭证与 ChatGPT Session.*独立且都必需/);
@@ -96,8 +125,7 @@ test('standalone runtime preserves authenticated task control contracts', () => 
   assert.match(syncCredentialSkill, /不得把 Work usage 页面当作 Chat 页面/);
   assert.match(dynamicController, /CHATGPT_AUTO_CONFIRM_REPOSITORY/);
   assert.match(dynamicController, /tasks\/actions-inbox\.json/);
-  assert.match(nativeSource, /skills\/actions-first-task-queue\/SKILL\.md/);
-  assert.match(nativeSource, /tasks\/actions-inbox\.json/);
+  assert.match(nativeQueueState, /tasks\/actions-inbox\.json/);
   assert.match(restoreSessionScript, /mode === 'restore'/);
   assert.match(restoreSessionScript, /process\.exit\(0\)/);
   assert.match(restoreSessionScript, /Page\.reload/);
@@ -260,9 +288,10 @@ test('task prompt templates expose the strict report protocol', async () => {
   }));
   const payload = await response.json();
   assert.equal(payload.result.structuredContent.templates.length, 4);
-  const templateText = payload.result.structuredContent.templates
-    .map(template => template.promptPrefix).join('\n');
-  assert.equal(templateText, '');
+  assert.deepEqual(
+    payload.result.structuredContent.templates.map(template => template.promptPrefix),
+    ['', '', '', ''],
+  );
   assert.equal(payload.result.structuredContent.reportProtocol.protocol, 'mahayana.task-report.v1');
   assert.deepEqual(payload.result.structuredContent.reportProtocol.fields, [
     'task_id', 'applied_task_revision', 'applied_spec_digest',
