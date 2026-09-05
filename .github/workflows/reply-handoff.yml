@@ -1,0 +1,29 @@
+name: Reply handoff validation
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check syntax and exercise event lifecycle
+        run: |
+          node --check scripts/reply-handoff.mjs
+          node --check scripts/in-app-browser-capability-host.mjs
+          node --check server/index.mjs
+          node --experimental-strip-types --test test/reply-handoff.test.mjs test/in-app-browser-capability.test.mjs test/browser-supervisor.test.mjs > reply-handoff.tap 2>&1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reply-handoff-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}
+          path: reply-handoff.tap
+          retention-days: 90

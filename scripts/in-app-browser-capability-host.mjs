@@ -1,3 +1,4 @@
+import { ReplyHandoff, handoffAvailable } from './reply-handoff.mjs';
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
@@ -394,7 +395,7 @@ async function readPageState(tab) {
       }));
     const bodyText = document.body?.innerText || '';
     const bodyLower = bodyText.toLowerCase();
-    const stopAnswer = controls.some(control => /停止回答|停止生成|stop generating|stop responding/iu.test(control.label));
+    const stopAnswer = controls.some(control => /停止回答|停止生成|stop generating|stop responding|stop answering/iu.test(control.label));
     const retry = controls.some(control => /重试|retry|重新生成|regenerate/iu.test(control.label));
     const conversationMarker = document.querySelector('[data-above-composer-conversation-id]')
       ?.getAttribute('data-above-composer-conversation-id') || '';
@@ -1679,6 +1680,7 @@ async function capabilityStatus(host) {
     ok: true,
     capability: BROWSER_CAPABILITY,
     browser: 'iab',
+    replyHandoffAvailable: handoffAvailable(host.localWorkBridge),
     model: BROWSER_MODEL,
     reasoning: BROWSER_REASONING,
     surface: 'chat',
@@ -1706,6 +1708,7 @@ export async function createInAppBrowserCapabilityHost({
   jobStateFile = DEFAULT_JOB_FILE,
   logger = () => {},
   recoverTab = reattachInAppBrowserTab,
+  localWorkBridge = null,
 } = {}) {
   if (!browser || !tab?.playwright) throw new Error('需要已授权的内置 Browser 和可控标签页');
   const policyCheck = validateBrowserPolicy(policy);
@@ -1716,6 +1719,7 @@ export async function createInAppBrowserCapabilityHost({
   const host = {
     browser,
     tab,
+    localWorkBridge,
     logger,
     recoverTab,
     policy: { ...BROWSER_DISPATCH_POLICY },
@@ -1737,6 +1741,17 @@ export async function createInAppBrowserCapabilityHost({
     pageRefreshWindowStartedAt: Date.now(),
     lastPageRefreshAt: 0,
   };
+  host.replyHandoff = new ReplyHandoff({
+    stateFile: `${host.jobStateFile}.reply-handoff.json`,
+    bridge: localWorkBridge,
+    readSnapshot: async watch => {
+      // Never navigate/recreate a tab or read another conversation on its behalf.
+      const watchedTab = await browser.tabs.get(watch.tabId);
+      const state = await readPageState(watchedTab);
+      return { ...state, pageError: isPageLoadFailureState(state) };
+    },
+  });
+  await host.replyHandoff.restore();
   const restoredJobs = await restoreJobs(host.jobStateFile);
   for (const job of restoredJobs) registerJob(host, job);
   host.activeJob = restoredJobs[0] || null;
@@ -1900,6 +1915,26 @@ export async function createInAppBrowserCapabilityHost({
         json(res, 200, await capabilityStatus(host));
         return;
       }
+      if (requestUrl.pathname === '/v1/reply-handoff' && req.method === 'POST') {
+        if (!handoffAvailable(localWorkBridge)) {
+          json(res, 503, { ok: false, errorCode: 'independent_work_bridge_unavailable',
+            message: '宿主未提供跨模型回合持续运行、绑定本地 Work 并去重确认的通知接口。不能交还等待。' });
+          return;
+        }
+        const body = await requestBody(req);
+        let result;
+        if (body.action === 'register') {
+          if (activeBrowserJobs(host).some(job => job.tabId === body.tabId)) {
+            json(res, 409, { ok: false, errorCode: 'tab_owned_by_goal_dispatcher' });
+            return;
+          }
+          result = await host.replyHandoff.register(body);
+        } else if (body.action === 'cancel') result = await host.replyHandoff.cancel(body.watchId);
+        else if (body.action === 'status') result = host.replyHandoff.status(body.watchId);
+        else throw new Error('invalid_handoff_action');
+        json(res, 200, { ok: true, ...result });
+        return;
+      }
       const jobMatch = requestUrl.pathname.match(/^\/v1\/chat\/jobs\/([^/]+)(\/stop)?$/u);
       if (req.method === 'GET' && jobMatch) {
         const job = jobForId(host, jobMatch[1]);
@@ -2027,9 +2062,21 @@ export async function createInAppBrowserCapabilityHost({
   host.descriptor = { ...descriptor, token: undefined };
   host.server = server;
   let released = false;
+  let handoffTimer;
+  // A process callback polls; the model is never invoked for unchanged state.
+  // The independent lifetime declaration is supplied only by a trusted host.
+  const handoffTick = async () => {
+    if (released || Date.now() >= host.expiresAt) return;
+    try { await host.replyHandoff.tick(); }
+    catch { host.logger({ event: 'handoff_state_unavailable' }); }
+    if (!released) handoffTimer = setTimeout(handoffTick, 1000);
+  };
+  if (handoffAvailable(localWorkBridge)) handoffTimer = setTimeout(handoffTick, 1000);
   host.release = async () => {
     if (released) return;
     released = true;
+    clearTimeout(handoffTimer);
+    await host.replyHandoff.tail;
     host.pumpStopRequested = true;
     for (const waiter of host.jobWaiters.splice(0)) waiter(null);
     await new Promise(resolvePromise => server.close(() => resolvePromise()));
@@ -2069,6 +2116,7 @@ export async function attachPersistentInAppBrowserCapabilityHost({
   jobStateFile = DEFAULT_JOB_FILE,
   logger = () => {},
   recoverTab = reattachInAppBrowserTab,
+  localWorkBridge = null,
 } = {}) {
   const recovery = await recoverTab({
     browser,
@@ -2086,6 +2134,7 @@ export async function attachPersistentInAppBrowserCapabilityHost({
     jobStateFile,
     logger,
     recoverTab,
+    localWorkBridge,
   });
   host.bootstrapReattachMethod = recovery.method;
   return host;

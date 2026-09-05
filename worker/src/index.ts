@@ -90,6 +90,16 @@ const queuedTaskSchema = {
   },
 };
 const tools = [
+  { name: 'browser_reply_handoff', description: '注册网页回复结束后唤醒本地 Luna 中等推理任务；只有独立持久宿主和去重通知接口实际就绪才接受注册。注册成功后可结束本地回合，不轮询。', annotations: annotations(), inputSchema: {
+    type: 'object', additionalProperties: false, required: ['action', 'watchId'], properties: {
+      action: { type: 'string', enum: ['register', 'status', 'cancel'] },
+      watchId: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,128}$' },
+      tabId: { type: 'string' }, threadId: { type: 'string' },
+      conversationUrl: { type: 'string' },
+      expectedUserDigest: { type: 'string', description: '本轮已发送用户消息的 SHA-256，避免把旧回复当作新回复' },
+      baselineAssistantDigest: { type: 'string', description: '发送前最后一条 assistant 消息的 SHA-256；不存在时为空字符串的 SHA-256' },
+    },
+  } },
   { name: 'account_list', description: '列出本机已注册的 ChatGPT 账号（不返回凭证、邮箱或 Cookie）', annotations: annotations(true), inputSchema: {
     type: 'object', additionalProperties: false, properties: {},
   } },
@@ -373,6 +383,10 @@ export default {
         rpc.id, 'desktop.chatgpt-approvals.audit', { limit: args.limit ?? 20 }, 'none');
       if (name === 'diagnose') return hostResult(
         rpc.id, 'desktop.chatgpt-approvals.diagnose', {}, 'none');
+      if (name === 'browser_reply_handoff') return reply(rpc.id, {
+        isError: true, content: [{ type: 'text', text: '此功能需要本地插件和独立 Work 通知宿主，云端不能模拟注册成功。' }],
+        structuredContent: { ok: false, errorCode: 'local_work_bridge_required' },
+      });
       if (name === 'dispatch_goal') {
         const goal = String(args.goal ?? '').trim();
         if (!goal || goal.length > 10000) {

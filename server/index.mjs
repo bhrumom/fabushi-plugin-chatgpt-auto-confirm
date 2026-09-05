@@ -1190,6 +1190,12 @@ async function runDirectDesktopTool(rpc) {
 
 async function runInAppBrowserTool(rpc) {
   const tool = String(rpc.params?.name ?? '');
+  if (tool === 'browser_reply_handoff') {
+    const descriptor = await readBrowserCapability();
+    if (!descriptor.ok) return browserToolResponse(rpc, tool, descriptor);
+    const result = await callBrowserCapability(descriptor, '/v1/reply-handoff', 'POST', rpc.params?.arguments || {});
+    return browserToolResponse(rpc, tool, result);
+  }
   if (!new Set(['dispatch_goal', 'browser_capability_status', 'browser_job_status', 'browser_stop', 'browser_watch']).has(tool)) return null;
   if (tool === 'browser_watch') {
     const persistedJobs = await readPersistedBrowserJobs();
