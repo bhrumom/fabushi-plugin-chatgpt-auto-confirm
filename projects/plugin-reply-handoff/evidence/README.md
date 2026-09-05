@@ -20,6 +20,10 @@
   is created automatically when the executable is present, binds the current
   `CODEX_THREAD_ID` when a caller omits `threadId`, and can be disabled with
   `CHATGPT_AUTO_CONFIRM_WORK_BRIDGE=0`.
+- Local MCP smoke (no model turn): `work_bridge_status` returned
+  `enabled=true`, `available=true`, `transport=codex-queue`,
+  `model=gpt-5.6-luna`, `thinking=medium`; `browser_reply_handoff` was present
+  in `tools/list`.
 - Initial CI: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/actions/runs/33946773891 passed for e38714c9bfaa0eb6a01434c7a60e95d039935f11.
 - Draft PR: https://github.com/bhrumom/fabushi-plugin-chatgpt-auto-confirm/pull/2.
 - No real web-to-Work wake or scoped auto-confirmation is claimed until the
