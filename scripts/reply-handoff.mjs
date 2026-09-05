@@ -108,6 +108,10 @@ export class ReplyHandoff {
       diagnostic: watch.diagnostic, model: LOCAL_EXECUTOR.model, thinking: LOCAL_EXECUTOR.thinking };
   }
 
+  list() {
+    return [...this.watches.values()].map(watch => this.status(watch.watchId));
+  }
+
   cancel(watchId) {
     return this.serial(async () => {
       this.status(watchId);
@@ -120,7 +124,7 @@ export class ReplyHandoff {
 
   tick() {
     return this.serial(async () => {
-      if (!handoffAvailable(this.bridge)) return;
+      if (!handoffAvailable(this.bridge)) return this.list();
       for (const watch of this.watches.values()) {
         if (terminal.has(watch.status) || watch.retryAt > this.now()) continue;
         try {
@@ -179,6 +183,7 @@ export class ReplyHandoff {
           await this.save();
         }
       }
+      return this.list();
     });
   }
 }

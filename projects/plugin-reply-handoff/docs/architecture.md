@@ -28,27 +28,40 @@ observations 2 seconds apart can enter the outbox. A response end is not project
 completion. A changed user turn supersedes the watch; missing page state waits.
 
 The authenticated browser host exposes POST /v1/reply-handoff via the local MCP
-browser_reply_handoff tool. A host timer checks once per second without invoking
-a model. It returns a registration receipt immediately. The cloud tool refuses
-registration. It does not silently replace this with model heartbeats.
+browser_reply_handoff tool. Registration returns immediately, then the
+long-lived plugin server supervises `tick` once per second without invoking a
+model. The Browser lease only supplies the authenticated page snapshot; its
+compatibility timer is disabled for the bundled adapter, so two processes do
+not race on the same state file. The cloud tool refuses registration. It does
+not silently replace this with model heartbeats.
 
-## Required external adapter — currently unavailable
+## Local Work adapter
 
-The trusted host must supply localWorkBridge with:
+The trusted host accepts an explicit `localWorkBridge` or creates the bundled
+`scripts/local-work-bridge.mjs` adapter when the local Codex executable is
+installed. The adapter can be disabled with
+`CHATGPT_AUTO_CONFIRM_WORK_BRIDGE=0`. It uses the installed official
+Codex executable rather than private ChatGPT IPC:
 
 - independentLifetime=true: browser callbacks survive the local model turn;
-- idempotentDelivery=true: durably deduplicate wake requests by eventId;
-- ownsTask(threadId): verify this user-authorized local Work binding;
-- send({eventId,threadId,model,thinking,prompt}): enqueue a local Work message,
-  enforce Luna/medium and acknowledge {accepted:true,eventId} after durable
-  acceptance. Queue safely while the task is busy; do not duplicate turns.
+- idempotentDelivery=true: a 0600, atomic event ledger deduplicates wake
+  requests by eventId;
+- ownsTask(threadId): run the official local app-server `thread/resume` probe and
+  require the exact returned thread identity;
+- send({eventId,threadId,model,thinking,prompt}): enforce Luna/medium, then call
+  `codex queue --thread` with `--approve-for-me` so the local Work queue accepts
+  the message while the web turn is already finished. The command is passed as
+  argv with `shell:false`; no private IPC, shell interpolation or answer-body
+  forwarding is used.
 
-This declaration is an integration contract, not proof that a host exists.
-Current CUA only exposes per-turn browser operations; the plugin's older
-Playwright host requires a live execution lease. Neither provides this adapter.
-Default availability is false. Never supply a fake adapter or a callback that
-only sends a desktop notification. Never patch private app IPC or bypass host
-security. The user has not been told this is deployed or zero-token hosting.
+The adapter only acts after a caller registers an exact Work thread, so it does
+not enqueue unsolicited work. A current local Work caller may omit `threadId`
+because the plugin binds the process-provided `CODEX_THREAD_ID`; an explicit id
+still wins for recovery. An explicit `localWorkBridge: null` or the environment
+opt-out leaves availability false. The app-server probe and queue command are both bounded; a failed probe or
+enqueue leaves the handoff pending for retry instead of pretending that a local
+turn was accepted. Never supply a fake adapter or a callback that only sends a
+desktop notification. Never patch private app IPC or bypass host security.
 
 Notifications carry fixed text and a bound conversation URL, never web content as
 trusted instructions. Delivery retry uses the same event ID and bounded backoff.
@@ -59,9 +72,11 @@ stops its timer and leaves pending state for a later independent host.
 
 ## Still required before real operation
 
-1. Supported independent browser + desktop Work adapter and real end-to-end
-   evidence across a local turn ending, web completion and a single Work wake.
-2. Task-scoped local confirmation adapter. Existing plugin global approveAll
+1. Real end-to-end evidence across a local turn ending, web completion and a
+   single Work wake using the installed Codex executable. The focused tests use
+   injected command runners and do not prove a signed-in local session.
+2. Task-scoped local confirmation adapter. `--approve-for-me` is the supported
+   Codex review path for queued Work messages; existing plugin global approveAll
    was disabled when inspected; do not enable it globally to mask this gap.
    Match pending requests to the entrusted task, classify the actual operation,
    preserve sensitive-input/manual-only boundaries, and audit decisions.

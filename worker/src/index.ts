@@ -94,11 +94,14 @@ const tools = [
     type: 'object', additionalProperties: false, required: ['action', 'watchId'], properties: {
       action: { type: 'string', enum: ['register', 'status', 'cancel'] },
       watchId: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,128}$' },
-      tabId: { type: 'string' }, threadId: { type: 'string' },
+      tabId: { type: 'string' }, threadId: { type: 'string', description: '本地 Work 会话 ID；在当前 Work 回合中可省略，插件会绑定当前 CODEX_THREAD_ID' },
       conversationUrl: { type: 'string' },
       expectedUserDigest: { type: 'string', description: '本轮已发送用户消息的 SHA-256，避免把旧回复当作新回复' },
       baselineAssistantDigest: { type: 'string', description: '发送前最后一条 assistant 消息的 SHA-256；不存在时为空字符串的 SHA-256' },
     },
+  } },
+  { name: 'work_bridge_status', description: '读取本机 Work 唤醒桥的受支持传输、模型和启用状态；不会启动模型回合或返回会话内容', annotations: annotations(true), inputSchema: {
+    type: 'object', additionalProperties: false, properties: {},
   } },
   { name: 'account_list', description: '列出本机已注册的 ChatGPT 账号（不返回凭证、邮箱或 Cookie）', annotations: annotations(true), inputSchema: {
     type: 'object', additionalProperties: false, properties: {},
@@ -387,6 +390,8 @@ export default {
         isError: true, content: [{ type: 'text', text: '此功能需要本地插件和独立 Work 通知宿主，云端不能模拟注册成功。' }],
         structuredContent: { ok: false, errorCode: 'local_work_bridge_required' },
       });
+      if (name === 'work_bridge_status') return hostResult(
+        rpc.id, 'desktop.chatgpt-work-bridge.status', {}, 'none');
       if (name === 'dispatch_goal') {
         const goal = String(args.goal ?? '').trim();
         if (!goal || goal.length > 10000) {

@@ -26,3 +26,37 @@ The long-running host bootstrap is the sole permitted recovery exception to plug
 While Chat is responding, do not send another message to that tab. When a response ends, the plugin independently checks that tab's latest reply. Each task ends only when its own latest reply contains a valid `MAHAYANA_TASK_REPORT_V1` completion certificate with `status=complete`, `all_tasks_complete=true`, non-empty completion and verification evidence, empty `remaining` and `blockers`, `wait_seconds=0`, and an empty `next_task`. Natural-language claims without a valid certificate are not completion. If a reply is incomplete, vague, blocked, malformed, missing the certificate, or ends early, the plugin increments only that job's attempt, opens a fresh Chat in only that job's tab, and sends only that original complete goal again. It never carries the previous response into the next prompt.
 
 The queue stops a job only after the plugin's completion detector confirms that whole goal is complete and verified, or the user explicitly stops that job. A host disconnect, plugin restart, incomplete response, authorization card, Browser/CDP/UI automation error, transient Browser error, or partial implementation must leave that task recoverable and must not be treated as completion. The host remains alive while either of its two jobs is non-terminal.
+
+## Return to the local Work turn without polling
+
+When the local Work agent needs one web ChatGPT answer for planning, review, or a
+decision and must continue locally after that answer, use the `browser_reply_handoff`
+tool after the web message has been sent. Capture the exact ChatGPT URL, the SHA-256
+of the user message just sent, and the SHA-256 of the last assistant message before
+sending; then register:
+
+```json
+{
+  "action": "register",
+  "watchId": "web-plan-1",
+  "tabId": "<authorized-browser-tab>",
+  "conversationUrl": "https://chatgpt.com/c/<conversation-id>",
+  "expectedUserDigest": "<sha256-of-sent-user-message>",
+  "baselineAssistantDigest": "<sha256-of-previous-assistant-message>"
+}
+```
+
+Inside a local Work turn, `threadId` may be omitted; the local plugin host binds
+the current `CODEX_THREAD_ID`. The tool accepts the registration only after an
+independent local Work bridge has proved ownership. Once it reports `waiting`, end
+the current Work turn immediately. Do not call `browser_watch`, read the web page
+repeatedly, or issue model heartbeats while the web answer is generating. The
+plugin server observes the authorized page outside the model turn, waits for two
+stable seconds with no stop/retry/error/authorization state, and queues one fixed
+resume message to `gpt-5.6-luna` with medium reasoning. The queue uses the supported
+Codex app-server ownership check and `codex queue --thread`; the event id is
+deduplicated durably and the message never includes the web answer body.
+
+When the local Work turn wakes, read the complete web answer once, validate it, and
+continue the task. A missing or changed tab, an unfinished answer, or a changed user
+turn is a recoverable wait/supersession state; it is never treated as completion.

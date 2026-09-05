@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import worker from '../worker/src/index.ts';
 import { DEFAULT_BROWSER_HEARTBEAT_SLICE_MS } from '../scripts/in-app-browser-capability-host.mjs';
+import { localWorkBridgeDescriptor } from '../scripts/local-work-bridge.mjs';
 
 const defaultNativeRuntime = fileURLToPath(new URL(
   '../runtime/macos/chatgpt-auto-confirm', import.meta.url));
@@ -24,9 +25,11 @@ const browserCapabilityFile = process.env.CHATGPT_AUTO_CONFIRM_BROWSER_CAPABILIT
 const browserJobStateFile = process.env.CHATGPT_AUTO_CONFIRM_BROWSER_JOB_FILE
   || resolve(homedir(), '.codex', 'browser', 'chatgpt-auto-confirm-job.json');
 const browserSupervisors = new Map();
+let replyHandoffSupervisor = null;
 const desktopDirectJobs = new Map();
 const sleep = milliseconds => new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds));
 const browserTerminalStatuses = new Set(['completed', 'stopped', 'failed']);
+const replyHandoffTerminalStatuses = new Set(['delivered', 'cancelled', 'superseded']);
 const maxParallelBrowserJobs = 2;
 const configuredBrowserHostRetryDelayMs = Number(process.env.CHATGPT_AUTO_CONFIRM_BROWSER_RETRY_MS);
 const browserHostRetryDelayMs = Number.isFinite(configuredBrowserHostRetryDelayMs)
@@ -324,6 +327,74 @@ function maybeStartBrowserSupervisor(result) {
 
 async function resumePersistedBrowserSupervisor() {
   for (const job of await readPersistedBrowserJobs()) startBrowserSupervisor(job.id);
+}
+
+function replyHandoffWatches(result) {
+  return Array.isArray(result?.replyHandoffWatches)
+    ? result.replyHandoffWatches.filter(Boolean) : [];
+}
+
+// Reply handoff observation is intentionally owned by the plugin server, not
+// by the model turn that registered it. The trusted Browser host exposes one
+// bounded `tick` endpoint; this loop keeps checking that endpoint after the
+// caller's turn has returned and stops as soon as every watch is terminal.
+function startReplyHandoffSupervisor() {
+  if (replyHandoffSupervisor) return;
+  const supervisor = (async () => {
+    let unavailableSince = 0;
+    while (true) {
+      const descriptor = await readBrowserCapability();
+      if (!descriptor.ok) {
+        unavailableSince ||= Date.now();
+        // Preserve watches across a short Browser lease rotation. If the
+        // descriptor never returns, bound this background loop so an orphaned
+        // capability cannot keep a process alive forever.
+        if (Date.now() - unavailableSince > 7 * 24 * 60 * 60 * 1000) break;
+        await sleep(browserHostRetryDelayMs);
+        continue;
+      }
+      unavailableSince = 0;
+      const health = await callBrowserCapability(
+        descriptor, '/v1/capability', 'GET', undefined, 5_000,
+      );
+      if (!health?.ok) {
+        await sleep(browserHostRetryDelayMs);
+        continue;
+      }
+      const watches = replyHandoffWatches(health);
+      if (watches.length === 0) break;
+      if (watches.every(watch => replyHandoffTerminalStatuses.has(watch.status))) break;
+      const result = await callBrowserCapability(
+        descriptor,
+        '/v1/reply-handoff',
+        'POST',
+        { action: 'tick', watchId: watches[0]?.watchId },
+        15_000,
+      );
+      if (!result?.ok) {
+        await sleep(browserHostRetryDelayMs);
+        continue;
+      }
+      const updated = Array.isArray(result.watches) ? result.watches : [];
+      if (updated.length > 0
+          && updated.every(watch => replyHandoffTerminalStatuses.has(watch.status))) break;
+      await sleep(1_000);
+    }
+  })().catch(() => {}).finally(() => {
+    replyHandoffSupervisor = null;
+  });
+  replyHandoffSupervisor = supervisor;
+}
+
+async function resumePersistedReplyHandoffSupervisor() {
+  const descriptor = await readBrowserCapability();
+  if (!descriptor.ok) return;
+  const health = await callBrowserCapability(
+    descriptor, '/v1/capability', 'GET', undefined, 5_000,
+  );
+  if (replyHandoffWatches(health).some(watch => !replyHandoffTerminalStatuses.has(watch.status))) {
+    startReplyHandoffSupervisor();
+  }
 }
 
 function resultBrowserJobs(result, fallback = []) {
@@ -1193,7 +1264,19 @@ async function runInAppBrowserTool(rpc) {
   if (tool === 'browser_reply_handoff') {
     const descriptor = await readBrowserCapability();
     if (!descriptor.ok) return browserToolResponse(rpc, tool, descriptor);
-    const result = await callBrowserCapability(descriptor, '/v1/reply-handoff', 'POST', rpc.params?.arguments || {});
+    const requested = { ...(rpc.params?.arguments || {}) };
+    // MCP calls made from a local Work turn do not need to copy their own
+    // thread id into the prompt. Codex exposes the exact current thread to
+    // the per-host process; an explicit argument still wins for recovery or
+    // an operator-owned Work thread.
+    if (requested.action === 'register' && !String(requested.threadId || '').trim()) {
+      const currentThreadId = String(process.env.CODEX_THREAD_ID || '').trim();
+      if (currentThreadId) requested.threadId = currentThreadId;
+    }
+    const result = await callBrowserCapability(descriptor, '/v1/reply-handoff', 'POST', requested);
+    if (result?.ok && requested.action === 'register') {
+      startReplyHandoffSupervisor();
+    }
     return browserToolResponse(rpc, tool, result);
   }
   if (!new Set(['dispatch_goal', 'browser_capability_status', 'browser_job_status', 'browser_stop', 'browser_watch']).has(tool)) return null;
@@ -1208,6 +1291,9 @@ async function runInAppBrowserTool(rpc) {
       ? await callBrowserCapability(descriptor, '/v1/capability', 'GET', undefined, 5_000)
       : descriptor;
     const jobs = resultBrowserJobs(health, persistedJobs);
+    if (replyHandoffWatches(health).some(watch => !replyHandoffTerminalStatuses.has(watch.status))) {
+      startReplyHandoffSupervisor();
+    }
     const reattachJobs = waitingForBrowserHost(jobs);
     const reattachRequired = !descriptor.ok || !health?.ok
       || health?.reattachRequired === true
@@ -1286,6 +1372,9 @@ async function runInAppBrowserTool(rpc) {
   }
   if (tool === 'browser_capability_status') {
     const result = await callBrowserCapability(descriptor, '/v1/capability');
+    if (replyHandoffWatches(result).some(watch => !replyHandoffTerminalStatuses.has(watch.status))) {
+      startReplyHandoffSupervisor();
+    }
     maybeStartBrowserSupervisor(result);
     const jobs = resultBrowserJobs(result);
     const reattachJobs = waitingForBrowserHost(jobs);
@@ -1335,6 +1424,15 @@ async function runInAppBrowserTool(rpc) {
     reattach: reattachRequired ? browserReattachMetadata(reattachJobs[0]) : null,
     reattachments: reattachJobs.map(browserReattachMetadata),
   } : result);
+}
+
+function runLocalWorkBridgeTool(rpc) {
+  const tool = String(rpc.params?.name ?? '');
+  if (tool !== 'work_bridge_status') return null;
+  return nativeToolResponse(rpc, tool, {
+    ok: true,
+    ...localWorkBridgeDescriptor(),
+  });
 }
 
 function runWindowsCredentialTool(rpc) {
@@ -1446,6 +1544,7 @@ function runNativeTool(rpc) {
 // started. The supervisor waits for a newly authorized Browser host if the
 // previous host/context was closed, so a later timer tick can resume it.
 void resumePersistedBrowserSupervisor();
+void resumePersistedReplyHandoffSupervisor();
 
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of lines) {
@@ -1463,10 +1562,13 @@ for await (const line of lines) {
   const browserResponse = rpc.method === 'tools/call'
     ? await runInAppBrowserTool(rpc)
     : null;
+  const localWorkBridgeResponse = rpc.method === 'tools/call'
+    ? runLocalWorkBridgeTool(rpc)
+    : null;
   const directResponse = rpc.method === 'tools/call'
     ? await runDirectDesktopTool(rpc)
     : null;
-  const nativeResponse = browserResponse || directResponse || (rpc.method === 'tools/call'
+  const nativeResponse = browserResponse || localWorkBridgeResponse || directResponse || (rpc.method === 'tools/call'
     ? (runWindowsCredentialTool(rpc) || runNativeTool(rpc))
     : null);
   if (nativeResponse) {

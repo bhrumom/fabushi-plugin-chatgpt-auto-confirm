@@ -111,7 +111,7 @@ test('real loopback host rejects registration without independent Work bridge', 
   const directory = await mkdtemp(join(tmpdir(), 'handoff-host-'));
   const host = await createInAppBrowserCapabilityHost({ browser: {}, tab: { playwright: {} },
     startUrl: 'https://chatgpt.com/', capabilityFile: join(directory, 'capability.json'),
-    jobStateFile: join(directory, 'jobs.json') });
+    jobStateFile: join(directory, 'jobs.json'), localWorkBridge: null });
   try {
     const headers = { authorization: `Bearer ${host.token}`, 'content-type': 'application/json' };
     const unauthorized = await fetch(`${host.baseUrl}/v1/reply-handoff`, { method: 'POST', body: '{}' });

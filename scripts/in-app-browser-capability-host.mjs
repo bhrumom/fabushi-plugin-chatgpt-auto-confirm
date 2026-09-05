@@ -1,4 +1,5 @@
 import { ReplyHandoff, handoffAvailable } from './reply-handoff.mjs';
+import { createLocalWorkBridge } from './local-work-bridge.mjs';
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
@@ -1681,6 +1682,10 @@ async function capabilityStatus(host) {
     capability: BROWSER_CAPABILITY,
     browser: 'iab',
     replyHandoffAvailable: handoffAvailable(host.localWorkBridge),
+    localWorkBridge: typeof host.localWorkBridge?.status === 'function'
+      ? host.localWorkBridge.status() : null,
+    replyHandoffWatches: typeof host.replyHandoff?.list === 'function'
+      ? host.replyHandoff.list() : [],
     model: BROWSER_MODEL,
     reasoning: BROWSER_REASONING,
     surface: 'chat',
@@ -1708,7 +1713,7 @@ export async function createInAppBrowserCapabilityHost({
   jobStateFile = DEFAULT_JOB_FILE,
   logger = () => {},
   recoverTab = reattachInAppBrowserTab,
-  localWorkBridge = null,
+  localWorkBridge = undefined,
 } = {}) {
   if (!browser || !tab?.playwright) throw new Error('需要已授权的内置 Browser 和可控标签页');
   const policyCheck = validateBrowserPolicy(policy);
@@ -1716,10 +1721,21 @@ export async function createInAppBrowserCapabilityHost({
   const token = randomBytes(32).toString('base64url');
   const resolvedCapabilityFile = resolve(capabilityFile);
   const initialUrl = startUrl || await tab.playwright.evaluate(() => window.location.href);
+  const resolvedLocalWorkBridge = localWorkBridge === undefined
+    ? createLocalWorkBridge({
+      stateFile: `${resolve(jobStateFile)}.work-bridge.json`,
+      logger,
+    })
+    : localWorkBridge;
   const host = {
     browser,
     tab,
-    localWorkBridge,
+    // The explicit adapter remains authoritative. When no adapter is supplied,
+    // the bundled local bridge uses the supported Codex queue/app-server entry
+    // point. It survives the web model's turn because the queued Work message
+    // is accepted by a separate local process and durably deduplicated by event
+    // id.
+    localWorkBridge: resolvedLocalWorkBridge,
     logger,
     recoverTab,
     policy: { ...BROWSER_DISPATCH_POLICY },
@@ -1743,7 +1759,7 @@ export async function createInAppBrowserCapabilityHost({
   };
   host.replyHandoff = new ReplyHandoff({
     stateFile: `${host.jobStateFile}.reply-handoff.json`,
-    bridge: localWorkBridge,
+    bridge: host.localWorkBridge,
     readSnapshot: async watch => {
       // Never navigate/recreate a tab or read another conversation on its behalf.
       const watchedTab = await browser.tabs.get(watch.tabId);
@@ -1916,7 +1932,7 @@ export async function createInAppBrowserCapabilityHost({
         return;
       }
       if (requestUrl.pathname === '/v1/reply-handoff' && req.method === 'POST') {
-        if (!handoffAvailable(localWorkBridge)) {
+        if (!handoffAvailable(host.localWorkBridge)) {
           json(res, 503, { ok: false, errorCode: 'independent_work_bridge_unavailable',
             message: '宿主未提供跨模型回合持续运行、绑定本地 Work 并去重确认的通知接口。不能交还等待。' });
           return;
@@ -1931,6 +1947,9 @@ export async function createInAppBrowserCapabilityHost({
           result = await host.replyHandoff.register(body);
         } else if (body.action === 'cancel') result = await host.replyHandoff.cancel(body.watchId);
         else if (body.action === 'status') result = host.replyHandoff.status(body.watchId);
+        else if (body.action === 'tick') result = {
+          watches: await host.replyHandoff.tick(),
+        };
         else throw new Error('invalid_handoff_action');
         json(res, 200, { ok: true, ...result });
         return;
@@ -2071,7 +2090,10 @@ export async function createInAppBrowserCapabilityHost({
     catch { host.logger({ event: 'handoff_state_unavailable' }); }
     if (!released) handoffTimer = setTimeout(handoffTick, 1000);
   };
-  if (handoffAvailable(localWorkBridge)) handoffTimer = setTimeout(handoffTick, 1000);
+  if (handoffAvailable(host.localWorkBridge)
+      && host.localWorkBridge.serverSupervised === false) {
+    handoffTimer = setTimeout(handoffTick, 1000);
+  }
   host.release = async () => {
     if (released) return;
     released = true;
@@ -2116,7 +2138,7 @@ export async function attachPersistentInAppBrowserCapabilityHost({
   jobStateFile = DEFAULT_JOB_FILE,
   logger = () => {},
   recoverTab = reattachInAppBrowserTab,
-  localWorkBridge = null,
+  localWorkBridge = undefined,
 } = {}) {
   const recovery = await recoverTab({
     browser,
