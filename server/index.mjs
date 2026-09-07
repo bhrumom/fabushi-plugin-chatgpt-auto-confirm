@@ -55,6 +55,7 @@ const pluginDispatchParams = (goal) => ({
   approveAll: true,
   timeout: 21_600,
   stagnationTimeout: 10_800,
+  noFinalReplyTimeout: 300,
   maxRecoveryAttempts: 5,
   autoContinueIncomplete: true,
   maxTaskContinuations: 0,
@@ -1294,6 +1295,7 @@ async function watchDirectDesktopOrchestration(baseArgs, firstDispatch) {
   let current = firstDispatch;
   let handoffCount = 0;
   let recoveryAttempts = 0;
+  let noFinalReplyRetries = 0;
   let emptyWorkResultAttempts = 0;
   let plannerRetryAttempts = 0;
   let latestWorkResult = '';
@@ -1307,6 +1309,10 @@ async function watchDirectDesktopOrchestration(baseArgs, firstDispatch) {
   const stagnationMs = Math.min(3 * 60 * 60 * 1000, Math.max(
     60_000, Number(baseArgs.stagnationTimeout || 10_800) * 1000,
   ));
+  const noFinalReplyMs = Math.min(
+    stagnationMs,
+    Math.max(30_000, Number(baseArgs.noFinalReplyTimeout || 300) * 1000),
+  );
   const pollIntervalMs = Math.min(5_000, Math.max(
     200, Number(baseArgs.pollIntervalMs || 500),
   ));
@@ -1346,6 +1352,7 @@ async function watchDirectDesktopOrchestration(baseArgs, firstDispatch) {
     let lastProgressAt = Date.now();
     let latestState = null;
     let handedOff = false;
+    let noFinalReplySince = null;
     const roundDeadline = Date.now() + timeoutMs;
 
     while (Date.now() < roundDeadline) {
@@ -1381,6 +1388,19 @@ async function watchDirectDesktopOrchestration(baseArgs, firstDispatch) {
       const assistantCount = Number(latestState?.assistantMessageCount || 0);
       const content = String(latestState?.content || '').trim();
       const responseStarted = assistantCount > beforeAssistantCount;
+      const userTurnStarted = Number(latestState?.userMessageCount || 0)
+        > Number(current.beforeUserMessageCount || 0);
+      const noFinalReplyCandidate = latestState?.messageConfirmed === true
+        && userTurnStarted
+        && !responseStarted
+        && latestState?.streaming !== true;
+      if (noFinalReplyCandidate) {
+        if (noFinalReplySince == null) noFinalReplySince = Date.now();
+      } else {
+        noFinalReplySince = null;
+      }
+      const noFinalReplyDue = noFinalReplyCandidate
+        && Date.now() - Number(noFinalReplySince || Date.now()) >= noFinalReplyMs;
       const fingerprint = `${assistantCount}:${content.length}:${content.slice(-240)}:${latestState?.streaming === true}`;
       if (fingerprint !== lastFingerprint) {
         lastFingerprint = fingerprint;
@@ -1388,6 +1408,61 @@ async function watchDirectDesktopOrchestration(baseArgs, firstDispatch) {
         lastProgressAt = Date.now();
       } else {
         stableSamples += 1;
+      }
+
+      if (noFinalReplyDue) {
+        noFinalReplyRetries += 1;
+        recoveryAttempts += 1;
+        if (recoveryAttempts > maxRecoveryAttempts) {
+          return failure(
+            'no_final_reply_after_retries',
+            'Chat 会话已结束但没有最终回复；插件已关闭旧 Chat、用新的 Work Chat 重发原指令，并用尽自动重试次数。',
+            {
+              oldChatClosed: true,
+              oldChatPreserved: false,
+              continuationMode: 'fresh_chat_after_no_final_reply_exhausted',
+              noFinalReplyRetries,
+              sessionEndedWithoutFinalReply: true,
+            },
+          );
+        }
+        handoffCount += 1;
+        if (maxTaskContinuations > 0 && handoffCount > maxTaskContinuations) {
+          return failure(
+            'task_continuation_limit_reached',
+            'Chat 会话没有最终回复，且已达到调用方设置的 Chat 续作上限。',
+            { noFinalReplyRetries, sessionEndedWithoutFinalReply: true },
+          );
+        }
+        const retryMessage = stripDesktopTaskReportContract(
+          String(current.sentPrompt || baseArgs.message || originalGoal).trim(),
+        );
+        const retryArgs = directDesktopRoundArguments(baseArgs, current, {
+          message: role === 'planner' ? originalGoal : retryMessage,
+          role,
+          autoPlanAfterWork: role === 'work',
+          workResult: role === 'planner' ? latestWorkResult : '',
+        });
+        const retryDispatch = await directDesktopSend({
+          params: { arguments: retryArgs },
+        });
+        if (!retryDispatch?.ok) {
+          return failure(
+            'no_final_reply_recovery_failed',
+            'Chat 会话没有最终回复，且新的插件 Chat 尚未确认发送。',
+            {
+              oldChatClosed: true,
+              oldChatPreserved: false,
+              continuationMode: 'fresh_chat_after_no_final_reply',
+              noFinalReplyRetries,
+              sessionEndedWithoutFinalReply: true,
+              sendVerification: retryDispatch,
+            },
+          );
+        }
+        current = retryDispatch;
+        handedOff = true;
+        break;
       }
 
       if (!latestState?.streaming && responseStarted && stableSamples >= 3) {

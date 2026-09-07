@@ -7,6 +7,11 @@ import SystemConfiguration
 let defaultChatWatchTimeoutSeconds = 21_600
 let maxChatWatchTimeoutSeconds = 86_400
 let defaultChatStagnationTimeoutSeconds = 10_800
+// A Chat can stop exposing its composer/streaming controls without ever
+// creating a final assistant message. Do not leave that round waiting for the
+// multi-hour stagnation watchdog; close it and resend the same instruction in
+// a fresh plugin Chat after this bounded window.
+let defaultChatNoFinalReplyTimeoutSeconds = 300
 
 
 func commandJSONParams() -> [String: Any] {
@@ -56,7 +61,7 @@ let nativeCommandSummaries: [String: String] = [
   "add_connector": "在插件自有的 Chat 页面中选择一个 ChatGPT connector。",
   "get_reply": "读取插件自有 Chat 页面中的最新回复。",
   "chat_status": "读取插件自有 Chat 表面、conversationId 和页面状态。",
-  "send_and_watch": "发送工作目标、读取自然结果，再由新规划 Chat 验收并编排下一轮。",
+  "send_and_watch": "发送工作目标、读取自然结果；无最终回复时关闭旧 Chat 并在新 Work Chat 重发，再由新规划 Chat 验收并编排下一轮。",
 ]
 
 func nativeCommandUsage(_ command: String, executable: String) -> String {
@@ -190,7 +195,7 @@ ChatGPT 自动确认 macOS 原生运行时
   add_connector JSON     选择 connector
   get_reply [JSON]       读取最新回复
   chat_status [JSON]     查看插件 Chat 状态
-  send_and_watch JSON    工作自然结果 → 新规划 Chat → 下一轮工作
+  send_and_watch JSON    工作自然结果 →（无最终回复则新 Work Chat 重发）→ 新规划 Chat → 下一轮工作
 
 帮助：
   \(executable) help start
@@ -2399,6 +2404,10 @@ case "send_and_watch":
   let newChat = !resumeExisting && !freshTargetPrepared
   let timeout = min(maxChatWatchTimeoutSeconds, max(10, params["timeout"] as? Int ?? defaultChatWatchTimeoutSeconds))
   let stagnationTimeout = min(defaultChatStagnationTimeoutSeconds, max(60, params["stagnationTimeout"] as? Int ?? defaultChatStagnationTimeoutSeconds))
+  let noFinalReplyTimeout = min(
+    defaultChatStagnationTimeoutSeconds,
+    max(30, params["noFinalReplyTimeout"] as? Int ?? defaultChatNoFinalReplyTimeoutSeconds)
+  )
   let maxRecoveryAttempts = min(5, max(0, params["maxRecoveryAttempts"] as? Int ?? 5))
   let autoContinueIncomplete = params["autoContinueIncomplete"] as? Bool ?? true
   let maxTaskContinuations = min(
@@ -2635,8 +2644,13 @@ case "send_and_watch":
   var screenshotPath: String?
   var recoveryEvents: [[String: Any]] = []
   var recoveryAttempts = 0
+  var noFinalReplyRetries = 0
+  var noFinalReplyExhausted = false
   var lastActivitySignature = baselineReply?["activitySignature"] as? String ?? ""
   var lastPageChangeAt = Date()
+  var currentRoundSentAt = Date()
+  var noFinalReplySince: Date?
+  var noFinalReplySessionEnded = false
   var completionCandidateSince: Date?
   var completionCandidateSignature = ""
 
@@ -2716,6 +2730,41 @@ case "send_and_watch":
       let isStreaming = replyResult["streaming"] as? Bool ?? false
       finalReply = replyResult
       let activitySignature = replyResult["activitySignature"] as? String ?? ""
+      let awaitingAssistant = replyResult["awaitingAssistant"] as? Bool ?? false
+      let waitingForApproval = replyResult["waitingForApproval"] as? Bool ?? false
+      // `getReplyJS` reports the last assistant node even when it belongs to
+      // the previous round. Only treat content as belonging to this round
+      // after the assistant count has advanced past the captured baseline.
+      let responseContent = (messageCount > baselineMessageCount
+        ? (replyResult["content"] as? String ?? "")
+        : "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      // This is the specific terminal failure the caller described: the user
+      // turn exists, but the Chat has no assistant turn, no visible stream,
+      // no stop control, and no approval waiting to be handled. It is not a
+      // valid empty result and must never be handed to the planner.
+      let noFinalReplyCandidate = !sawNewReply
+        && messageCount <= baselineMessageCount
+        && awaitingAssistant
+        && !isStreaming
+        && !(replyResult["stopAvailable"] as? Bool ?? false)
+        && !waitingForApproval
+        && responseContent.isEmpty
+        && !(replyResult["completionCandidate"] as? Bool ?? false)
+        && !(replyResult["terminalIncomplete"] as? Bool ?? false)
+      if noFinalReplyCandidate {
+        if noFinalReplySince == nil {
+          noFinalReplySince = Date()
+          emitProgress([
+            "event": "no_final_reply_waiting",
+            "message": "当前 Chat 已收到指令但尚未产生最终回复；插件先等待有界窗口。",
+            "timeoutSeconds": noFinalReplyTimeout,
+            "role": role,
+          ])
+        }
+      } else {
+        noFinalReplySince = nil
+      }
       if !activitySignature.isEmpty && activitySignature != lastActivitySignature {
         lastActivitySignature = activitySignature
         lastPageChangeAt = Date()
@@ -2790,16 +2839,29 @@ case "send_and_watch":
       }
     }
 
-    if Date().timeIntervalSince(lastPageChangeAt) >= Double(stagnationTimeout) {
+    let noFinalReplyStableSeconds = noFinalReplySince.map {
+      Date().timeIntervalSince($0)
+    } ?? 0
+    noFinalReplySessionEnded = noFinalReplySince != nil
+      && Date().timeIntervalSince(currentRoundSentAt) >= Double(noFinalReplyTimeout)
+      && noFinalReplyStableSeconds >= Double(noFinalReplyTimeout)
+    if noFinalReplySessionEnded
+      || Date().timeIntervalSince(lastPageChangeAt) >= Double(stagnationTimeout) {
       let diagnostic = cdpEvaluateOnChatGPT(pageDiagnosticJS(), preferredURL: activeChatURL) ?? [:]
       stalledPageContent = diagnostic["content"] as? String ?? (finalReply["pageContent"] as? String ?? "")
       stalledButtons = diagnostic["buttons"] as? [String] ?? []
       let devspaceWaiting = finalReply["devspaceWaiting"] as? Bool ?? false
-      let diagnosticKind = devspaceWaiting ? "devspace-timeout" : "page-stalled"
+      let recoveryWasNoFinalReply = noFinalReplySessionEnded
+      let diagnosticKind = noFinalReplySessionEnded
+        ? "no-final-reply"
+        : (devspaceWaiting ? "devspace-timeout" : "page-stalled")
       screenshotPath = captureHiddenChatScreenshot(state, label: "\(diagnosticKind)-\(recoveryAttempts + 1)")
 
       if recoveryAttempts < maxRecoveryAttempts {
         recoveryAttempts += 1
+        if noFinalReplySessionEnded {
+          noFinalReplyRetries += 1
+        }
         // A stalled round is disposable. Close the exact plugin-owned ChatGPT
         // target and its matching plugin profile before retrying, then launch a
         // genuinely fresh Chat. This prevents late responses and duplicate
@@ -2815,7 +2877,9 @@ case "send_and_watch":
         state.enabled = true
 
         let continuationPreparation: [String: Any]
-        let continuationMode = "fresh_plugin_chat_after_stall"
+        let continuationMode = recoveryWasNoFinalReply
+          ? "fresh_plugin_chat_after_no_final_reply"
+          : "fresh_plugin_chat_after_stall"
         let recoveryResult: [String: Any]
         let freshPreparation = ensureHiddenChatTarget(
           &state,
@@ -2867,6 +2931,9 @@ case "send_and_watch":
             sawNewReply = false
             prevCharCount = 0
             lastActivitySignature = freshBaseline?["activitySignature"] as? String ?? ""
+            currentRoundSentAt = Date()
+            noFinalReplySince = nil
+            noFinalReplySessionEnded = false
             completionCandidateSince = nil
             completionCandidateSignature = ""
             stalledPageContent = ""
@@ -2887,8 +2954,14 @@ case "send_and_watch":
         }
         let recoveryEvent: [String: Any] = [
           "attempt": recoveryAttempts,
-          "reason": devspaceWaiting ? "devspace_timeout" : "page_stalled",
-          "idleSeconds": stagnationTimeout,
+          "reason": recoveryWasNoFinalReply
+            ? "no_final_reply"
+            : (devspaceWaiting ? "devspace_timeout" : "page_stalled"),
+          "idleSeconds": recoveryWasNoFinalReply
+            ? Int(noFinalReplyStableSeconds)
+            : stagnationTimeout,
+          "noFinalReplyTimeout": noFinalReplyTimeout,
+          "sessionEndedWithoutFinalReply": recoveryWasNoFinalReply,
           "screenshotPath": screenshotPath as Any,
           "oldChatClosed": true,
           "oldChatPreserved": false,
@@ -2905,14 +2978,18 @@ case "send_and_watch":
         if recoveryResult["ok"] as? Bool == true {
           lastPageChangeAt = Date()
           lastActivitySignature = ""
+          noFinalReplySince = nil
+          noFinalReplySessionEnded = false
           Thread.sleep(forTimeInterval: 1.0)
         } else {
           closeBackgroundTargets(&state)
           try? saveState(state)
+          noFinalReplyExhausted = recoveryWasNoFinalReply
           stalled = true
           break
         }
       } else {
+        noFinalReplyExhausted = noFinalReplySessionEnded
         closeBackgroundTargets(&state)
         try? saveState(state)
         stalled = true
@@ -3031,8 +3108,11 @@ case "send_and_watch":
   resultPayload["surfaceDrift"] = surfaceDrift
   resultPayload["surfaceStatus"] = surfaceDriftStatus
   resultPayload["stagnationTimeout"] = stagnationTimeout
+  resultPayload["noFinalReplyTimeout"] = noFinalReplyTimeout
   resultPayload["maxRecoveryAttempts"] = maxRecoveryAttempts
   resultPayload["recoveryAttempts"] = recoveryAttempts
+  resultPayload["noFinalReplyRetries"] = noFinalReplyRetries
+  resultPayload["sessionEndedWithoutFinalReply"] = noFinalReplyExhausted
   resultPayload["recoveries"] = recoveryEvents
   resultPayload["taskReport"] = taskReport as Any
   resultPayload["taskStatus"] = effectiveTaskStatus as Any
@@ -3048,8 +3128,12 @@ case "send_and_watch":
     resultPayload["message"] = "插件自有页面已离开 Chat 表面；小程序在批准或发送任何后续操作前立即退出并保存诊断。"
   } else if stalled {
     let devspaceWaiting = finalReply["devspaceWaiting"] as? Bool ?? false
-    resultPayload["errorCode"] = devspaceWaiting ? "devspace_timeout" : "page_stalled"
-    resultPayload["message"] = "Chat 页面和可见思考连续 \(stagnationTimeout) 秒没有新内容，小程序已用尽自动续作次数并保存截图与页面文本。"
+    resultPayload["errorCode"] = noFinalReplyExhausted
+      ? "no_final_reply_after_retries"
+      : (devspaceWaiting ? "devspace_timeout" : "page_stalled")
+    resultPayload["message"] = noFinalReplyExhausted
+      ? "Chat 会话已结束但没有最终回复；插件已关闭旧 Chat、用新的 Work Chat 重发原指令，并用尽自动重试次数。"
+      : "Chat 页面和可见思考连续 \(stagnationTimeout) 秒没有新内容，小程序已用尽自动续作次数并保存截图与页面文本。"
   } else if timedOut {
     resultPayload["errorCode"] = "watch_timeout"
     resultPayload["message"] = "等待 ChatGPT 最终结果超过 \(timeout) 秒，小程序已截图并返回当前可见思考。"

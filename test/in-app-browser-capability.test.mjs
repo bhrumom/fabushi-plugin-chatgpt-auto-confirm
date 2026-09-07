@@ -29,6 +29,7 @@ test('in-app Browser policy is fixed to the authorized Chat surface', () => {
   assert.equal(BROWSER_DISPATCH_POLICY.reasoning, 'Extra High');
   assert.equal(BROWSER_DISPATCH_POLICY.surface, 'chat');
   assert.equal(BROWSER_DISPATCH_POLICY.goalOnlyDispatch, false);
+  assert.equal(BROWSER_DISPATCH_POLICY.noFinalReplyTimeout, 300);
   assert.equal(BROWSER_DISPATCH_POLICY.maxConcurrentJobs, MAX_PARALLEL_BROWSER_JOBS);
   assert.deepEqual(validateBrowserPolicy({ ...BROWSER_DISPATCH_POLICY }), { ok: true });
   assert.equal(validateBrowserPolicy({ ...BROWSER_DISPATCH_POLICY, connector: 'devspace1' }).ok, false);

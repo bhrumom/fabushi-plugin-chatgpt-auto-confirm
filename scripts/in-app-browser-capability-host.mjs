@@ -28,6 +28,10 @@ const MAX_GOAL_LENGTH = 10_000;
 export const MAX_PARALLEL_BROWSER_JOBS = 2;
 const DEFAULT_TIMEOUT_SECONDS = 21_600;
 const DEFAULT_STAGNATION_SECONDS = 10_800;
+// A sent user turn can leave the Browser page looking idle without ever
+// creating a final assistant turn. Recover that bounded failure in a fresh
+// Chat instead of waiting for the multi-hour stagnation watchdog.
+const DEFAULT_NO_FINAL_REPLY_SECONDS = 300;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const configuredBrowserLeaseValue = typeof process === 'undefined'
   ? ''
@@ -73,6 +77,7 @@ export const BROWSER_DISPATCH_POLICY = Object.freeze({
   approveAll: true,
   timeout: DEFAULT_TIMEOUT_SECONDS,
   stagnationTimeout: DEFAULT_STAGNATION_SECONDS,
+  noFinalReplyTimeout: DEFAULT_NO_FINAL_REPLY_SECONDS,
   maxRecoveryAttempts: 5,
   autoContinueIncomplete: true,
   maxTaskContinuations: 0,
@@ -1443,6 +1448,7 @@ function resetBrowserResponseState(job) {
   job.stableSamples = 0;
   job.lastFingerprint = '';
   job.responseRunning = false;
+  job.noFinalReplySince = null;
   job.currentUrl = job.currentUrl || null;
 }
 
@@ -1463,20 +1469,25 @@ function handoffWorkResultToPlanner(job, state, reason = 'work_natural_result') 
   return true;
 }
 
-function retryWorkWithoutNaturalResult(job, state, policy = {}) {
-  const attempts = Number(job.emptyWorkResultAttempts || 0) + 1;
+function retryWorkWithoutNaturalResult(job, state, policy = {}, reason = 'empty-natural-result') {
+  const noFinalReply = reason === 'no-final-reply';
+  const attemptsKey = noFinalReply ? 'noFinalReplyAttempts' : 'emptyWorkResultAttempts';
+  const attempts = Number(job[attemptsKey] || 0) + 1;
   const configuredMaxAttempts = Number(policy.maxRecoveryAttempts);
   const maxAttempts = Number.isFinite(configuredMaxAttempts)
     ? Math.max(0, configuredMaxAttempts) : 5;
-  job.emptyWorkResultAttempts = attempts;
+  job[attemptsKey] = attempts;
   if (attempts > maxAttempts) {
     job.status = 'failed';
     job.phase = 'terminal';
-    job.error = 'Work Chat 已停止生成，但没有返回可交给规划 Chat 的自然语言结果；插件已用尽重试次数。';
+    job.error = noFinalReply
+      ? 'Work Chat 会话已结束但没有最终回复；插件已关闭旧 Chat、用新的 Work Chat 重发原指令，并用尽重试次数。'
+      : 'Work Chat 已停止生成，但没有返回可交给规划 Chat 的自然语言结果；插件已用尽重试次数。';
     job.lastOutcome = {
       kind: 'work-natural-result-missing',
-      reason: 'empty-natural-result-exhausted',
+      reason: noFinalReply ? 'no-final-reply-exhausted' : 'empty-natural-result-exhausted',
       conversationId: conversationIdFromState(state),
+      sessionEndedWithoutFinalReply: noFinalReply,
     };
     return false;
   }
@@ -1488,9 +1499,12 @@ function retryWorkWithoutNaturalResult(job, state, policy = {}) {
   job.status = 'handoff_to_fresh_chat';
   job.lastOutcome = {
     kind: 'work-natural-result-missing',
-    reason: 'empty-natural-result',
+    reason,
     attempt: attempts,
     conversationId: conversationIdFromState(state),
+    oldChatClosed: true,
+    oldChatPreserved: false,
+    sessionEndedWithoutFinalReply: noFinalReply,
   };
   resetBrowserResponseState(job);
   return true;
@@ -1589,6 +1603,7 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
       job.lastProgressAt = Date.now();
       job.stableSamples = 0;
       job.lastFingerprint = '';
+      job.noFinalReplySince = null;
       await persistJob(host, job);
       return publicJob(job);
     }
@@ -1617,6 +1632,25 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
     // stale failure after the page is healthy and the card is gone.
     job.authorization = null;
     const responseStarted = state.assistantCount > Number(job.beforeAssistantCount || 0);
+    const userTurnStarted = state.userCount > Number(job.beforeUserCount || 0);
+    // The user bubble is present, but the assistant count never advanced and
+    // the page is already idle. This is a ended-without-final-reply round,
+    // not an empty natural result and never a reason to call the planner.
+    const noFinalReplyCandidate = userTurnStarted
+      && !responseStarted
+      && !state.stopAnswer
+      && !state.pendingAuthorization;
+    if (noFinalReplyCandidate) {
+      if (!job.noFinalReplySince) job.noFinalReplySince = Date.now();
+    } else {
+      job.noFinalReplySince = null;
+    }
+    const noFinalReplyDue = noFinalReplyCandidate
+      && Date.now() - Number(job.noFinalReplySince || Date.now())
+        >= Math.min(
+          DEFAULT_STAGNATION_SECONDS,
+          Math.max(30, Number(host.policy.noFinalReplyTimeout || DEFAULT_NO_FINAL_REPLY_SECONDS)),
+        ) * 1000;
     const fingerprint = `${state.assistantCount}:${state.latestAssistantText.length}:${state.latestAssistantText.slice(-240)}`;
     if (fingerprint !== job.lastFingerprint) {
       job.lastFingerprint = fingerprint;
@@ -1625,7 +1659,42 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
     } else {
       job.stableSamples = Number(job.stableSamples || 0) + 1;
     }
-    if (!state.stopAnswer && responseStarted && job.stableSamples >= 3) {
+    if (noFinalReplyDue) {
+      if (job.role === 'work') {
+        retryWorkWithoutNaturalResult(job, state, host.policy, 'no-final-reply');
+      } else {
+        const attempts = Number(job.noFinalReplyAttempts || 0) + 1;
+        job.noFinalReplyAttempts = attempts;
+        const configuredMaxAttempts = Number(host.policy.maxRecoveryAttempts);
+        const maxAttempts = Number.isFinite(configuredMaxAttempts)
+          ? Math.max(0, configuredMaxAttempts) : 5;
+        if (attempts > maxAttempts) {
+          job.status = 'failed';
+          job.phase = 'terminal';
+          job.error = '规划 Chat 会话已结束但没有最终回执；插件已用新规划 Chat 重试并用尽次数。';
+          job.lastOutcome = {
+            kind: 'planner-report-missing',
+            reason: 'no-final-reply-exhausted',
+            attempt: attempts,
+            conversationId: conversationIdFromState(state),
+            sessionEndedWithoutFinalReply: true,
+          };
+        } else {
+          job.status = 'handoff_to_fresh_chat';
+          job.phase = 'planner_pending';
+          job.lastOutcome = {
+            kind: 'planner-report-missing',
+            reason: 'no-final-reply',
+            attempt: attempts,
+            conversationId: conversationIdFromState(state),
+            oldChatClosed: true,
+            oldChatPreserved: false,
+            sessionEndedWithoutFinalReply: true,
+          };
+          resetBrowserResponseState(job);
+        }
+      }
+    } else if (!state.stopAnswer && responseStarted && job.stableSamples >= 3) {
       const completion = job.role === 'planner'
         ? classifyPlannerResult(state.latestAssistantText || state.bodyText)
         : classifyWorkResult(state.latestAssistantText);
@@ -1725,6 +1794,8 @@ function publicJob(job) {
     lastOutcome: job.lastOutcome || null,
     error: job.error || null,
     emptyWorkResultAttempts: job.emptyWorkResultAttempts || 0,
+    noFinalReplyAttempts: job.noFinalReplyAttempts || 0,
+    noFinalReplySince: job.noFinalReplySince || null,
     reattachCount: job.reattachCount || 0,
     lastReattachedAt: job.lastReattachedAt || null,
     lastReattachMethod: job.lastReattachMethod || null,

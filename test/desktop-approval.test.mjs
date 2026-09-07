@@ -130,6 +130,7 @@ test('dispatch_goal makes the plugin own the complete fresh-Chat policy', async 
     approveAll: true,
     timeout: 21600,
     stagnationTimeout: 10800,
+    noFinalReplyTimeout: 300,
     maxRecoveryAttempts: 5,
     autoContinueIncomplete: true,
     maxTaskContinuations: 0,
@@ -248,6 +249,7 @@ test('send_and_watch streams visible thinking and recovers in a fresh Chat after
   assert.equal(params.newChat, true);
   assert.equal(params.timeout, 21600);
   assert.equal(params.stagnationTimeout, 10800);
+  assert.equal(params.noFinalReplyTimeout, 300);
   assert.equal(params.maxRecoveryAttempts, 5);
   assert.equal(params.autoContinueIncomplete, true);
   assert.equal(params.maxTaskContinuations, 0);
@@ -257,10 +259,15 @@ test('send_and_watch streams visible thinking and recovers in a fresh Chat after
   assert.match(nativeSource, /oldChatClosed/);
   assert.match(nativeSource, /"oldChatPreserved": false/);
   assert.match(nativeSource, /fresh_plugin_chat_after_stall/);
+  assert.match(nativeSource, /defaultChatNoFinalReplyTimeoutSeconds = 300/);
+  assert.match(nativeSource, /noFinalReplySessionEnded/);
+  assert.match(nativeSource, /fresh_plugin_chat_after_no_final_reply/);
+  assert.match(nativeSource, /sessionEndedWithoutFinalReply/);
+  assert.match(nativeSource, /no_final_reply_after_retries/);
   assert.match(nativeSource, /stopRequested/);
   assert.doesNotMatch(nativeSource, /fresh_chat_fallback/);
   const stallRecoveryStart = nativeSource.indexOf(
-    'if Date().timeIntervalSince(lastPageChangeAt)',
+    'if noFinalReplySessionEnded',
   );
   const stallRecoveryEnd = nativeSource.indexOf('// Save state', stallRecoveryStart);
   assert.ok(stallRecoveryStart >= 0 && stallRecoveryEnd > stallRecoveryStart);

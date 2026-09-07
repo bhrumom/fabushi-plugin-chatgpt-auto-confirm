@@ -29,6 +29,7 @@ For long-lived release, deployment, marketplace, or CI work, also apply the bund
    - `approveAll: true`;
    - `timeout: 21600` unless the user requests another total limit;
    - `stagnationTimeout: 10800` for 3 hours without new visible progress;
+   - `noFinalReplyTimeout: 300` so a sent turn that ends without an assistant final reply is closed and resent in a fresh Work Chat after five minutes;
    - `maxRecoveryAttempts: 5`;
    - select GPT-5.6 Sol and Extra High reasoning effort for complex implementation tasks when the model selector is available;
    - `autoContinueIncomplete: true`;
@@ -57,6 +58,8 @@ For an interrupted controller process, `resumeExisting: true` may bind the same 
 A stall requires 3 continuous hours with no change in the visible thinking summary, devspace tool activity, or central Chat content. Do not treat a slow build as stalled while its visible activity changes.
 
 The 3-hour timer applies only while ChatGPT still appears to be running. If generation has stopped and the stable response explicitly says the task is unfinished, blocked, or failed, return immediately with `chat_finished_incomplete`, the visible response, and diagnostics. Never wait for the stall timer after the Chat has ended.
+
+If the sent user turn is present but the session ends without any new assistant final reply, the plugin must not treat the empty state as a result or send it to the planner. After the bounded `noFinalReplyTimeout` window (default five minutes), it closes the exact old plugin Chat/profile/process, opens a fresh Work Chat, and resends the same Work instruction. This retry is separate from the planner handoff and is bounded by `maxRecoveryAttempts`.
 
 Do not let an unfinished Chat stop while useful work can continue. `MAHAYANA_TASK_REPORT_V1` is a planner-only completion/arrangement certificate: a work Chat emits natural language only, while a fresh planner Chat emits the certificate after inspecting the work result and repository state. An unfinished, waiting, blocked, or prematurely ended work Chat emits no task report; the controller closes that plugin-owned Chat when retrying and sends the same objective to a fresh Chat.
 

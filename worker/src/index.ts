@@ -6,6 +6,7 @@ const EMAIL_WORKFLOW_SUFFIX = '';
 const DEFAULT_CHAT_TIMEOUT_SECONDS = 21_600;
 const MAX_CHAT_TIMEOUT_SECONDS = 86_400;
 const CHAT_STAGNATION_TIMEOUT_SECONDS = 10_800;
+const CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS = 300;
 const PLUGIN_DISPATCH_BROWSER = 'iab';
 const PLUGIN_DISPATCH_CAPABILITY = 'browser.in-app.dispatch-and-watch';
 const PLUGIN_DISPATCH_MODEL = 'GPT-5.6 Sol';
@@ -28,6 +29,7 @@ const pluginDispatchParams = (goal: string) => ({
   approveAll: true,
   timeout: DEFAULT_CHAT_TIMEOUT_SECONDS,
   stagnationTimeout: CHAT_STAGNATION_TIMEOUT_SECONDS,
+  noFinalReplyTimeout: CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS,
   maxRecoveryAttempts: 5,
   autoContinueIncomplete: true,
   maxTaskContinuations: 0,
@@ -202,7 +204,7 @@ const tools = [
   { name: 'diagnose', description: '只读检查 ChatGPT 已加载的辅助功能结构', annotations: annotations(true), inputSchema: {
     type: 'object', additionalProperties: false, properties: {},
   } },
-  { name: 'dispatch_goal', description: '由插件总控通过受授权的内置 Browser 持续推进一个完整目标：每个目标都有独立标签页，最多两个目标可同时推进。第一轮发送给工作 Chat 的只有 goal；工作 Chat 返回自然结果后，插件新开规划/验收 Chat，只有规划 Chat 输出 MAHAYANA_TASK_REPORT_V1，并把 next_task 原文交给下一轮新的工作 Chat。插件固定使用聊天页、GPT-5.6 Sol 和 Extra High，自动批准授权卡；标签页可见或隐藏，重试前关闭精确的插件实例/标签页', annotations: annotations(), inputSchema: {
+  { name: 'dispatch_goal', description: '由插件总控通过受授权的内置 Browser 持续推进一个完整目标：每个目标都有独立标签页，最多两个目标可同时推进。第一轮发送给工作 Chat 的只有 goal；工作 Chat 返回自然结果后，插件新开规划/验收 Chat，只有规划 Chat 输出 MAHAYANA_TASK_REPORT_V1，并把 next_task 原文交给下一轮新的工作 Chat。工作 Chat 若已结束却没有最终回复，插件在有界等待后关闭旧 Chat 并用新 Work Chat 重发原指令，不把空结果交给规划 Chat。插件固定使用聊天页、GPT-5.6 Sol 和 Extra High，自动批准授权卡；标签页可见或隐藏，重试前关闭精确的插件实例/标签页', annotations: annotations(), inputSchema: {
     type: 'object', additionalProperties: false, required: ['goal'], properties: {
       goal: { type: 'string', minLength: 1, maxLength: 10000, description: '只填写原始目标；不要传入历史进度、上一轮回复或续作文本' },
     },
@@ -223,7 +225,7 @@ const tools = [
       jobId: { type: 'string', pattern: '^iab_[A-Za-z0-9-]{20,100}$' },
     },
   } },
-  { name: 'send_and_watch', description: '由插件总控在一个插件自有的 ChatGPT.app 实例中创建新 Chat、发送目标并等待最终回复；工作 Chat 返回自然结果后，插件自动新开规划/验收 Chat，读取其安排，再把 next_task 交给下一轮工作 Chat', annotations: annotations(), inputSchema: {
+  { name: 'send_and_watch', description: '由插件总控在一个插件自有的 ChatGPT.app 实例中创建新 Chat、发送目标并等待最终回复；若会话结束但没有最终回复，插件关闭旧 Chat 并在新 Work Chat 重发同一指令；工作 Chat 返回自然结果后，插件自动新开规划/验收 Chat，读取其安排，再把 next_task 交给下一轮工作 Chat', annotations: annotations(), inputSchema: {
     type: 'object', additionalProperties: false, properties: {
       message: { type: 'string', minLength: 1, maxLength: 10000, description: '填写本轮要执行的自然语言目标或规划 Chat 要求；工作 Chat 不会收到完成回执模板' },
       role: { type: 'string', enum: ['work', 'planner'], default: 'work', description: 'work=直接执行并返回自然结果；planner=读取工作结果、验收并按模板输出下一步安排' },
@@ -239,6 +241,7 @@ const tools = [
       timeout: { type: 'integer', minimum: 10, maximum: MAX_CHAT_TIMEOUT_SECONDS, default: DEFAULT_CHAT_TIMEOUT_SECONDS, description: '等待最终回复的最大秒数；必须长于 3 小时无进展阈值' },
       accountId: { type: 'string', pattern: '^acct_[0-9a-f]{12}$', description: '固定此插件自有 Chat 使用的账号' },
       stagnationTimeout: { type: 'integer', minimum: 60, maximum: CHAT_STAGNATION_TIMEOUT_SECONDS, default: CHAT_STAGNATION_TIMEOUT_SECONDS, description: '页面连续无新内容多少秒后关闭旧插件 Chat 并创建新 Chat；默认 3 小时' },
+      noFinalReplyTimeout: { type: 'integer', minimum: 30, maximum: CHAT_STAGNATION_TIMEOUT_SECONDS, default: CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS, description: '用户消息已发送但会话结束且没有最终回复时，等待多少秒后关闭旧插件 Chat 并用新的 Work Chat 重发原指令；默认 5 分钟' },
       maxRecoveryAttempts: { type: 'integer', minimum: 0, maximum: 5, default: 5, description: '页面无进展后关闭旧插件 Chat、创建新 Chat 并自动续作的最大次数；超过后截图并报错' },
       autoContinueIncomplete: { type: 'boolean', default: true, description: '回复明确未完成、阻塞、模糊或提前结束时，自动在全新 Chat 续作同一目标' },
       maxTaskContinuations: { type: 'integer', minimum: 0, maximum: 20, default: 0, description: '0 表示持续续作直到完成；正数表示显式上限' },
@@ -444,6 +447,7 @@ export default {
           newChat: !resumeExisting,
           timeout: Math.min(MAX_CHAT_TIMEOUT_SECONDS, Math.max(10, args.timeout ?? DEFAULT_CHAT_TIMEOUT_SECONDS)),
           stagnationTimeout: Math.min(CHAT_STAGNATION_TIMEOUT_SECONDS, Math.max(60, args.stagnationTimeout ?? CHAT_STAGNATION_TIMEOUT_SECONDS)),
+          noFinalReplyTimeout: Math.min(CHAT_STAGNATION_TIMEOUT_SECONDS, Math.max(30, args.noFinalReplyTimeout ?? CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS)),
           maxRecoveryAttempts: Math.min(5, Math.max(0, args.maxRecoveryAttempts ?? 5)),
           autoContinueIncomplete: args.autoContinueIncomplete !== false,
           maxTaskContinuations: Math.min(20, Math.max(0, args.maxTaskContinuations ?? 0)),
