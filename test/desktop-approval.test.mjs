@@ -45,6 +45,10 @@ const queueMonitoringSource = readFileSync(
   new URL('../native/QueueMonitoring.swift', import.meta.url),
   'utf8',
 );
+const queueWorkerSource = readFileSync(
+  new URL('../native/QueueWorker.swift', import.meta.url),
+  'utf8',
+);
 const queueTerminalDecisionSource = readFileSync(
   new URL('../native/QueueTerminalDecision.swift', import.meta.url),
   'utf8',
@@ -122,7 +126,7 @@ test('dispatch_goal makes the plugin own the complete fresh-Chat policy', async 
     surface: 'chat',
     newChat: true,
     resumeExisting: false,
-    goalOnlyDispatch: true,
+    goalOnlyDispatch: false,
     approveAll: true,
     timeout: 21600,
     stagnationTimeout: 10800,
@@ -140,42 +144,37 @@ test('dispatch_goal rejects an empty goal', async () => {
   assert.equal(result.error.code, -32602);
 });
 
-test('every task Chat receives only the final completion certificate', () => {
+test('Work Chat returns a natural result and a fresh planner Chat owns the certificate', () => {
   assert.match(chatScriptsSource, /func taskReportContract\(/);
-  assert.match(chatScriptsSource, /MAHAYANA_TASK_REPORT_CONTRACT_V5/);
+  assert.match(chatScriptsSource, /MAHAYANA_TASK_REPORT_CONTRACT_V6/);
+  assert.match(chatScriptsSource, /规划\/验收 Chat，不是工作 Chat/);
+  assert.match(chatScriptsSource, /只有规划\/验收 Chat 可以输出 MAHAYANA_TASK_REPORT_V1/);
   assert.match(chatScriptsSource, /"status":"complete"/);
   assert.match(chatScriptsSource, /"all_tasks_complete":true/);
-  assert.doesNotMatch(chatScriptsSource, /"status":"incomplete"/);
-  assert.match(chatScriptsSource, /只有当前目标、项目文档、实现、验收、测试、发布和必要证据全部完成/);
-  assert.match(chatScriptsSource, /小程序检测不到有效完成证书时/);
-  assert.doesNotMatch(chatScriptsSource, /MAHAYANA_TASK_WAIT_V1/);
-  assert.doesNotMatch(chatScriptsSource, /不要输出完成态 JSON/);
+  assert.match(chatScriptsSource, /func acceptancePlannerMessage\(/);
+  assert.match(chatScriptsSource, /工作 Chat 自然结果 BEGIN/);
   assert.match(nativeSource, /taskId: task\.id/);
   assert.match(nativeSource, /appliedRevision: task\.currentRevision/);
-  assert.match(nativeSource, /let reportSource = \[/);
-  assert.match(nativeSource, /reportMissing/);
-  assert.match(nativeSource, /let goalOnlyDispatch =/);
-  assert.match(nativeSource, /let defaultContinuationMessage = messageWithTaskReportContract\(originalGoal\)/);
-  assert.match(nativeSource, /if goalOnlyDispatch \{[\s\S]*?sendMessageJS\([\s\S]*?newChat: true/);
-  assert.match(nativeSource, /continuationMode = "fresh_chat_only_goal"/);
-  assert.match(nativeSource, /childParams\["resumeExisting"\] = true/);
-  assert.match(nativeSource, /message\.contains\("MAHAYANA_TASK_REPORT_CONTRACT_V5"\)/);
-  assert.doesNotMatch(nativeSource, /message\.contains\("MAHAYANA_TASK_REPORT_V1_BEGIN"\)/);
-  assert.doesNotMatch(nativeSource, /func legacyTaskReportContract/);
-  assert.match(nativeSource, /terminal_reply_missing_task_report/);
-  assert.doesNotMatch(nativeSource, /let acceptedResult = AutomationTaskReport\(/);
-  assert.doesNotMatch(nativeSource, /let normalResult = reportText/);
+  assert.match(nativeSource, /messageWithoutTaskReportContract/);
+  assert.match(nativeSource, /let outbound = automationTaskMessage/);
+  assert.match(nativeSource, /startAutomationPlanner/);
+  assert.match(nativeSource, /plannerHandoff/);
+  assert.match(nativeSource, /role == "work"/);
+  assert.match(nativeSource, /naturalWorkResult/);
+  assert.doesNotMatch(
+    queueWorkerSource,
+    /messageWithTaskReportContract\([\s\S]*?automationTaskMessage\(/,
+  );
 });
 
-test('a terminal Chat without a completion certificate is re-dispatched to a fresh Chat', () => {
-  assert.match(nativeSource, /let completionCertificateMissing =/);
-  assert.match(nativeSource, /resultPayload\["completionCertificateMissing"\]/);
-  assert.match(nativeSource, /completionCertificateMissing \|\| taskStatus == "incomplete"/);
-  assert.match(nativeSource, /missing-completion-certificate:/);
-  assert.match(nativeSource, /没有返回有效的 MAHAYANA_TASK_REPORT_V1 完成证书/);
-  assert.doesNotMatch(nativeSource, /继续完成下面的原始目标（自动续作第/);
-  assert.match(nativeSource, /childParams\["originalGoal"\] = originalGoal/);
-  assert.match(nativeSource, /message: continuationPrompt/);
+test('planner and Work turns recover through their own fresh-Chat boundaries', () => {
+  assert.match(nativeSource, /let reportMissing = role == "planner"/);
+  assert.match(nativeSource, /let workReplyReady = role == "work"/);
+  assert.match(nativeSource, /planner_report_missing/);
+  assert.match(nativeSource, /task_report_missing/);
+  assert.match(nativeSource, /planner_handoff_not_confirmed/);
+  assert.match(nativeSource, /childParams\["role"\] = role == "planner" \? "work"/);
+  assert.match(nativeSource, /messageWithoutTaskReportContract/);
   assert.match(nativeSource, /relayFreshChatContinuation\(childParams\)/);
 });
 
@@ -253,11 +252,11 @@ test('send_and_watch streams visible thinking and recovers in a fresh Chat after
   assert.equal(params.autoContinueIncomplete, true);
   assert.equal(params.maxTaskContinuations, 0);
   assert.match(nativeSource, /"thinking_progress"/);
-  assert.match(nativeSource, /stopCurrentResponseJS/);
-  assert.match(nativeSource, /continueInNewTaskJS/);
+  assert.match(nativeSource, /closeBackgroundTargets/);
   assert.match(nativeSource, /prepareNewChatTarget/);
-  assert.match(nativeSource, /oldChatPreserved/);
-  assert.match(nativeSource, /branch_in_new_chat/);
+  assert.match(nativeSource, /oldChatClosed/);
+  assert.match(nativeSource, /"oldChatPreserved": false/);
+  assert.match(nativeSource, /fresh_plugin_chat_after_stall/);
   assert.match(nativeSource, /stopRequested/);
   assert.doesNotMatch(nativeSource, /fresh_chat_fallback/);
   const stallRecoveryStart = nativeSource.indexOf(
@@ -265,10 +264,7 @@ test('send_and_watch streams visible thinking and recovers in a fresh Chat after
   );
   const stallRecoveryEnd = nativeSource.indexOf('// Save state', stallRecoveryStart);
   assert.ok(stallRecoveryStart >= 0 && stallRecoveryEnd > stallRecoveryStart);
-  assert.doesNotMatch(
-    nativeSource.slice(stallRecoveryStart, stallRecoveryEnd),
-    /stopCurrentResponseJS/,
-  );
+  assert.match(nativeSource.slice(stallRecoveryStart, stallRecoveryEnd), /closeBackgroundTargets/);
   assert.match(nativeSource, /message: continuationMessage/);
   assert.match(nativeSource, /newChat: false/);
   assert.doesNotMatch(nativeSource, /private func stopAndContinueJS/);
@@ -749,7 +745,7 @@ test('task queue tools preserve dependencies, resource locks, review gate and co
   assert.match(nativeSource, /const isChatLabel = label => label === 'chat'/);
   assert.match(nativeSource, /const explicitChatTab = modeTabs\(\)/);
   assert.match(nativeSource, /surface\.workComposer && explicitChatTab/);
-  assert.match(nativeSource, /hidden sender never reaches the Chat surface/);
+  assert.match(nativeSource, /plugin sender never reaches the Chat surface/);
   assert.match(nativeSource, /persisted-atom-update/);
   assert.match(nativeSource, /home-composer-mode-v1/);
   assert.match(nativeSource, /force-persisted-mode/);
@@ -838,17 +834,17 @@ test('task queue tools preserve dependencies, resource locks, review gate and co
   assert.doesNotMatch(nativeSource, /for _ in 0\.\.<120/);
   assert.match(nativeSource, /document\.dispatchEvent\(new Event\('visibilitychange'\)\)/);
   assert.match(nativeSource, /window\.dispatchEvent\(new Event\('focus'\)\)/);
-  assert.match(nativeSource, /document\.visibilityState remains hidden/);
+  assert.match(nativeSource, /Visibility is therefore diagnostic rather than a hard requirement/);
   assert.match(nativeSource, /parallelDedicatedProcessQueueWorkerMode/);
   assert.match(nativeSource, /A fresh parallel task must never fall back to a renderer/);
-  assert.match(nativeSource, /Each parallel task owns a fresh hidden Chat BrowserWindow/);
+  assert.match(nativeSource, /Each parallel task owns a fresh plugin Chat BrowserWindow/);
   assert.match(nativeSource, /visibility == "hidden"/);
   assert.match(nativeSource, /queueTargetIsHidden/);
   assert.match(nativeSource, /queue_worker_visibility_not_hidden/);
   assert.match(nativeSource, /queueOwnedSharedControllerVisible/);
   assert.match(nativeSource, /queue-owned-shared-controller-visible-accepted/);
   assert.match(nativeSource, /state\.backgroundProfilePath == hiddenChatProfilePath\(\)/);
-  assert.match(nativeSource, /Missing, suspended, and hidden-but-not-Chat renderers are disposable/);
+  assert.match(nativeSource, /Missing, suspended, and non-Chat renderers are disposable/);
   assert.match(nativeSource, /queue_monitor_hidden_target_rebuild_failed/);
   assert.match(nativeSource, /queue_monitor_hidden_target_recovery_failed/);
   assert.match(nativeSource, /queue_monitor_hidden_target_recreated_without_durable_conversation/);
@@ -905,7 +901,7 @@ test('task queue tools preserve dependencies, resource locks, review gate and co
   assert.match(nativeSource, /targetId == state\.queueWorkerTargetId/);
   assert.match(nativeSource, /unassigned_controller_fallback=/);
   assert.match(nativeSource, /environment\["CHATGPT_AUTO_CONFIRM_HEADLESS"\] = "1"/);
-  assert.match(nativeSource, /general confirmer has already proved that exact renderer is hidden/);
+  assert.match(nativeSource, /general confirmer has already proved that exact renderer is plugin-owned/);
   assert.match(nativeSource, /createSharedControllerQueueWorkerTarget/);
   assert.match(nativeSource, /hosted_controller_unavailable_or_busy/);
   assert.match(nativeSource, /state\.queueWorkerMode = sharedConversationQueueWorkerMode/);
@@ -954,11 +950,11 @@ test('task queue tools preserve dependencies, resource locks, review gate and co
   assert.match(nativeSource, /allowBlankConversationReuse: false/);
   assert.doesNotMatch(nativeSource, /allowBlankConversationReuse: !preserveStalledChat/);
   assert.match(nativeSource, /currentDate >= waitingUntil/);
-  assert.match(nativeSource, /Confirm it before restoring a task through its exact hidden-page route/);
+  assert.match(nativeSource, /Confirm it before restoring a task through its exact plugin-owned Chat route/);
   assert.match(nativeSource, /Do not restore the background queue renderer before its current page is read/);
 });
 
-test('native runtime stays in the background and never takes over the UI', () => {
+test('native runtime stays on the exact plugin Chat target and never takes over the UI', () => {
   const backgroundNativeSource = nativeSource.replace(
     /func activateChatGPTForLogin\(\) \{[\s\S]*?\n\}\n\nfunc waitForActionsLoginTarget/,
     'func waitForActionsLoginTarget',
@@ -994,7 +990,8 @@ test('native runtime stays in the background and never takes over the UI', () =>
   assert.match(nativeSource, /"operatesHiddenPages": true/);
   assert.match(nativeSource, /loadedApprovalTargets/);
   assert.match(nativeSource, /"scansEveryLoadedRenderer": false/);
-  assert.match(nativeSource, /"visibleRendererAccess": false/);
+  assert.match(nativeSource, /"visibleRendererAccess": isVisible && queueAllowsVisibleDedicatedRenderer\(\)/);
+  assert.match(nativeSource, /"operatesVisiblePluginPages": isVisible && queueAllowsVisibleDedicatedRenderer\(\)/);
   assert.match(nativeSource, /Runtime\.evaluate does not activate the app/);
   assert.match(nativeSource, /withWatcherLifecycleLock/);
   assert.match(nativeSource, /idleSystemSleepDisabled/);

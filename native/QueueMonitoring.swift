@@ -236,7 +236,9 @@ func queueContinuation(
     task.reportFingerprints = Array(fingerprints.suffix(100))
     let requestedWait = min(604_800, max(0, report.waitSeconds ?? 0))
     let waitReason = (report.waitReason ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    task.reviewFeedback = "上一个 Chat 报告任务未完成。请从同一 checkout 的现有进度继续，完成以下续作，不要从头开始：\n\(report.nextTask)\n\n上轮摘要：\(report.summary)\n剩余：\(report.remaining.joined(separator: "；"))\n卡点：\(report.blockers.joined(separator: "；"))"
+    let sanitizedNextTask = messageWithoutTaskReportContract(report.nextTask)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    task.reviewFeedback = "规划/验收 Chat 判定任务未完成。请从同一 checkout 的现有进度继续，直接执行下面的 next_task；这是给 Work Chat 的自然语言安排，不要输出 MAHAYANA_TASK_REPORT_V1：\n\(sanitizedNextTask)\n\n上轮摘要：\(report.summary)\n剩余：\(report.remaining.joined(separator: "；"))\n卡点：\(report.blockers.joined(separator: "；"))"
     if requestedWait > 0 {
       let dueDate = Date().addingTimeInterval(Double(max(30, requestedWait)))
       task.waitingUntil = isoFormatter.string(from: dueDate)
@@ -252,7 +254,7 @@ func queueContinuation(
       task.lastError = reason
     }
   } else {
-    task.reviewFeedback = "上一个 Chat 没有给出有效的最终完成证书（\(reason)）。请在新的 Chat 中重新读取同一 GitHub 仓库的项目文档和已落盘进度，只补做剩余步骤。只有整个项目全部完成时才输出唯一完成证书；否则不要输出报告模板。"
+    task.reviewFeedback = "规划/验收 Chat 没有给出有效的安排或完成证书（\(reason)）。请在新的 Work Chat 中重新读取同一 GitHub 仓库的项目文档和已落盘进度，只补做剩余步骤。Work Chat 只输出自然语言结果，不要输出 MAHAYANA_TASK_REPORT_V1。"
     task.waitingUntil = nil
     task.waitReason = nil
     task.status = "queued"
@@ -277,6 +279,9 @@ func queueContinuation(
   let shallowTerminalReasons = [
     "unfinished_reply_missing_continuation_report",
     "terminal_reply_missing_task_report",
+    "planner_report_missing",
+    "work_reply_missing",
+    "work_natural_result_missing",
     "chat_finished_incomplete",
     "chat_finished_blocked",
   ]
@@ -326,7 +331,7 @@ func deferAutomationTaskForWorkerRecovery(
   task.waitingUntil = isoFormatter.string(
     from: Date().addingTimeInterval(Double(delay))
   )
-  task.waitReason = "隐藏 Chat worker 自动恢复：\(reason)；约 \(delay) 秒后重试"
+  task.waitReason = "插件 Chat worker 自动恢复：\(reason)；约 \(delay) 秒后重试"
   task.lastError = "waiting_for_queue_worker_recovery"
   task.hiddenWorkerLastError = reason
   task.hiddenWorkerRecoveryCount = recoveryCount
@@ -342,7 +347,7 @@ func deferAutomationTaskForWorkerRecovery(
   task.updatedAt = now
   task.reviewFeedback = [
     task.reviewFeedback,
-    "隐藏 Chat worker 已由本地守护器自动重建。请从同一 checkout 的最新落盘进度继续，不要从头开始或重复已完成步骤。",
+    "插件 Chat worker 已由本地守护器自动重建。页面可见或隐藏不影响编排；请从同一 checkout 的最新落盘进度继续，不要从头开始或重复已完成步骤。",
   ].compactMap { $0 }.joined(separator: "\n\n")
   state.queuePaused = false
   queueTrace(
@@ -358,6 +363,7 @@ func monitorAutomationTask(
   let monitoringReview = task.reviewStatus == "running"
   let activeConversationId = monitoringReview ? task.reviewConversationId : task.conversationId
   guard let conversationId = activeConversationId else {
+    closeDedicatedAutomationTarget(task, state: state)
     queueContinuation(&task, report: nil, reason: "missing_conversation_id")
     return
   }
@@ -396,8 +402,8 @@ func monitorAutomationTask(
     refreshLifecycle: true
   )
   if runtimeState == .hiddenNonChat {
-    // A hidden prewarm page may survive an internal app reload on Work. Ask
-    // that hidden page to return to Chat before treating the renderer as lost.
+    // A plugin prewarm page may survive an internal app reload on Work. Ask
+    // that page to return to Chat before treating the renderer as lost.
     let chatSelection = cdpValue(
       port: port,
       targetId: targetId,
@@ -419,12 +425,10 @@ func monitorAutomationTask(
     runtimeState,
     workerMode: state.queueWorkerMode
   )
-  // The local fallback uses the primary renderer of a separate queue-owned
-  // ChatGPT process. Electron can report that document as `visible` after an
-  // approval-card remount even though the background application and profile
-  // remain isolated from the user's visible ChatGPT process. Accept this
-  // narrow ownership match; never broaden visible-page access to another
-  // profile, port, target, or worker mode.
+  // Electron can report the plugin-owned renderer as `visible` after an
+  // approval-card remount. Accept that exact target when the deployment allows
+  // visible plugin pages; never broaden access to another profile, port, target,
+  // or worker mode.
   let queueOwnedSharedControllerVisible = runtimeState == .visible
     && state.queueWorkerMode == sharedConversationQueueWorkerMode
     && port == state.backgroundAppPort
@@ -439,22 +443,22 @@ func monitorAutomationTask(
     queueTrace("task=\(task.id) stage=queue-owned-shared-controller-visible-accepted")
   }
   if !effectiveWorkerStateUsable {
-    if runtimeState == .visible {
-      // Safety remains fail-closed for every visible renderer that does not
-      // exactly match the queue-owned background controller above.
+    if runtimeState == .visible && !queueAllowsVisibleDedicatedRenderer() {
+      // An explicitly strict deployment still fails closed for a visible
+      // renderer, but visibility is not a requirement in the normal path.
       let now = isoFormatter.string(from: Date())
       state.queuePaused = true
       task.status = "blocked"
-      task.hiddenWorkerLastError = "queue_worker_visibility_not_hidden"
+      task.hiddenWorkerLastError = "queue_worker_visibility_not_allowed"
       task.lastError = task.hiddenWorkerLastError
       task.updatedAt = now
       task.finishedAt = now
       return
     }
 
-    // Missing, suspended, and hidden-but-not-Chat renderers are disposable
-    // queue-owned pages. Close any stale target, recreate ChatGPT's official
-    // show:false prewarm BrowserWindow, and verify hidden Chat again.
+    // Missing, suspended, and non-Chat renderers are disposable
+    // queue-owned pages. Close any stale target, recreate the plugin-owned
+    // ChatGPT renderer, and verify the Chat surface again.
     let failedRuntimeState = queueTargetRuntimeStateName(runtimeState)
     closeDedicatedAutomationTarget(task, state: state)
     let recoveredWorker: (port: Int, targetId: String, profilePath: String)?
@@ -480,9 +484,10 @@ func monitorAutomationTask(
 
     if conversationId.hasPrefix("local-chatgpt:") {
       // A reclaimed local-only Chat has no durable route to restore. The page
-      // is already rebuilt and verified hidden; continue the task in a fresh
+      // is already rebuilt and verified as a plugin-owned Chat target; continue the task in a fresh
       // Chat that explicitly resumes from the same checkout instead of waiting
       // forever on an identity that no longer exists.
+      closeDedicatedAutomationTarget(task, state: state)
       task.hiddenWorkerLastError = "queue_monitor_hidden_target_recreated_without_durable_conversation"
       queueContinuation(
         &task,
@@ -525,7 +530,7 @@ func monitorAutomationTask(
   task.hiddenWorkerLastHeartbeatAt = isoFormatter.string(from: Date())
   task.hiddenWorkerLastError = nil
   // A permission card can replace the normal conversation body temporarily.
-  // Confirm it before restoring a task through its exact hidden-page route, so
+  // Confirm it before restoring a task through its exact plugin-owned Chat route, so
   // an unloaded conversation cannot suppress automatic authorization.
   let now = isoFormatter.string(from: Date())
   let approval = approveDedicatedAuthorizationWithDiagnostics(
@@ -600,7 +605,7 @@ func monitorAutomationTask(
     }
   }
   let dispatchMarker = monitoringReview
-    ? "验收 Chat 标识：\(task.id)-\(task.attempts)-\(task.reviewRound)"
+    ? "规划验收 Chat 标识：\(task.id)-\(task.attempts)-\(task.reviewRound)"
     : "任务发送轮次：\(task.attempts)"
   let currentPageContent = [
     reply["pageContent"] as? String ?? "",
@@ -663,7 +668,7 @@ func monitorAutomationTask(
     task.lastActivitySignature = observedActivitySignature
     task.lastProgressAt = now
   }
-  // The hidden queue renderer can still drift after an internal reload. Never
+  // The queue renderer can still drift after an internal reload. Never
   // parse a stale page as the active task or create a continuation/review Chat
   // from it. Restoring here is safe because this process has no user composer.
   if let observed = observedConversationId,
@@ -700,7 +705,7 @@ func monitorAutomationTask(
       // switch. Wait for the dispatch marker instead of pausing every queued
       // task; recover in one fresh Chat only if that binding never arrives.
       // Never navigate away from or close a renderer while ChatGPT is still
-      // responding. Closing the hidden target cancels the server-side stream
+      // responding. Closing the plugin-owned target cancels the server-side stream
       // and is exactly what users see as an automatically stopped reply.
       if responseIsInFlight || dispatchAge < 300 {
         let pendingReason = responseIsInFlight
@@ -720,6 +725,7 @@ func monitorAutomationTask(
         return
       }
       if conversationId.hasPrefix("local-chatgpt:") {
+        closeDedicatedAutomationTarget(task, state: state)
         queueContinuation(&task, report: nil, reason: "fresh_chat_body_pending_timeout")
         return
       }
@@ -739,7 +745,7 @@ func monitorAutomationTask(
          restoredId == conversationId {
         liveStatus = statusAfterRestore
       } else {
-        // This hidden renderer is owned solely by the queue, so a failed
+        // This plugin-owned renderer is owned solely by the queue, so a failed
         // restore is a disposable renderer fault rather than user navigation.
         // Recreate it inside the same app process and continue from checkout.
         closeDedicatedAutomationTarget(task, state: state)
@@ -903,6 +909,7 @@ func monitorAutomationTask(
   if !hasAssistantActivity, !isStreaming, isPending,
      let lastProgressAt = task.lastProgressAt.flatMap(isoFormatter.date(from:)),
      Date().timeIntervalSince(lastProgressAt) >= Double(queueChatStartTimeoutSeconds) {
+    closeDedicatedAutomationTarget(task, state: state)
     queueContinuation(&task, report: nil, reason: "chat_start_no_reply")
     return
   }
@@ -912,13 +919,17 @@ func monitorAutomationTask(
     queueNetworkRecovery(&task, state: &state, reason: signal)
     return
   }
+  // A Work Chat is intentionally free-form. Only the fresh planner/acceptance
+  // Chat is allowed to emit and be parsed as MAHAYANA_TASK_REPORT_V1.
   let reportText = completedActivity.isEmpty ? visibleContent : completedActivity
-  let parsedReport = parseTaskReport(reportText).flatMap(automationReport)
-  let parsedWait = parseTaskWait(reportText)
+  let parsedReport = monitoringReview
+    ? parseTaskReport(reportText).flatMap(automationReport)
+    : nil
+  let parsedWait = monitoringReview ? parseTaskWait(reportText) : nil
   let terminalIncomplete = terminalDecision.terminalIncomplete
   let terminal = terminalDecision.terminal
   let hasClosedTaskReport = reply["hasClosedTaskReport"] as? Bool == true
-  if terminal, hasClosedTaskReport, parsedReport == nil {
+  if terminal, monitoringReview, hasClosedTaskReport, parsedReport == nil {
     queueTrace(
       "task=\(task.id) stage=report-parse-failed action=continue "
         + "reason=closed_task_report_not_fully_complete"
@@ -950,7 +961,7 @@ func monitorAutomationTask(
     )
     return
   }
-  if terminal, !automationTaskRevisionIsCurrent(task, report: parsedReport) {
+  if terminal, monitoringReview, !automationTaskRevisionIsCurrent(task, report: parsedReport) {
     let currentRevision = max(1, task.currentRevision ?? 1)
     let appliedRevision = max(1, parsedReport?.appliedTaskRevision ?? task.appliedRevision ?? 1)
     closeDedicatedAutomationTarget(task, state: state)
@@ -977,6 +988,10 @@ func monitorAutomationTask(
       task.connector = requestedConnector
     }
     if monitoringReview {
+      // The planner Chat is complete for this round. Close its exact
+      // plugin-owned renderer before either finishing or handing next_task to
+      // a new Work Chat so repeated rounds do not accumulate instances.
+      closeDedicatedAutomationTarget(task, state: state)
       task.reviewReport = report
       task.reviewStatus = report.status
       if taskReportIsFullyComplete(report) {
@@ -1027,14 +1042,49 @@ func monitorAutomationTask(
     return
   }
   if terminal {
-    closeDedicatedAutomationTarget(task, state: state)
-    queueContinuation(
+    if monitoringReview {
+      // Planner output must contain the machine-readable arrangement. If it
+      // does not, retry the orchestration from a fresh Work Chat; never pass a
+      // report template into that Work Chat.
+      closeDedicatedAutomationTarget(task, state: state)
+      queueContinuation(&task, report: nil, reason: "planner_report_missing")
+      return
+    }
+
+    let naturalWorkReply = [
+      visibleContent,
+      completedActivity,
+      reply["activity"] as? String ?? "",
+    ]
+    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    .first { !$0.isEmpty } ?? ""
+    guard !naturalWorkReply.isEmpty else {
+      closeDedicatedAutomationTarget(task, state: state)
+      queueContinuation(
+        &task,
+        report: nil,
+        reason: terminalIncomplete ? "work_reply_missing" : "work_natural_result_missing"
+      )
+      return
+    }
+
+    // Handoff is a new Chat boundary. Keep the completed Work renderer alive
+    // until the planner send is confirmed, because it is the source of the
+    // natural result being relayed.
+    guard startAutomationPlanner(
       &task,
-      report: nil,
-      reason: terminalIncomplete
-        ? "unfinished_reply_missing_continuation_report"
-        : "terminal_reply_missing_task_report"
-    )
+      workResult: naturalWorkReply,
+      port: port,
+      targetId: targetId,
+      state: state
+    ) else {
+      task.lastError = "planner_handoff_pending"
+      task.updatedAt = now
+      task.lastProgressAt = now
+      return
+    }
+    task.status = "running"
+    task.lastError = nil
     return
   }
 
@@ -1058,6 +1108,11 @@ func monitorAutomationTask(
       task.updatedAt = now
       return
     }
+    // A stalled round is disposable. Close the exact plugin-owned renderer
+    // before queueContinuation clears its ownership fields; the next attempt
+    // will create a fresh ChatGPT target/profile and cannot accumulate old
+    // windows or late responses.
+    closeDedicatedAutomationTarget(task, state: state)
     queueContinuation(&task, report: nil, reason: "page_stalled")
   }
 }
@@ -1448,19 +1503,20 @@ func recoverQueueWithWatchdog(
   for index in eligibleIndexes {
     let previousStatus = tasks[index].status
     if previousStatus == "running" {
+      closeDedicatedAutomationTarget(tasks[index], state: state)
       queueContinuation(
         &tasks[index],
         report: tasks[index].report,
         reason: "github_actions_watchdog_recovery"
       )
-      // The old hidden page is intentionally left running, but it is no
-      // longer the task's active ownership record. The next Chat gets a new
+      // The old plugin-owned page was closed above. The next Chat gets a new
       // renderer and can proceed independently.
       tasks[index].workerPort = nil
       tasks[index].workerTargetId = nil
       tasks[index].workerStatePath = nil
       tasks[index].workerProfilePath = nil
     } else if previousStatus != "queued" {
+      closeDedicatedAutomationTarget(tasks[index], state: state)
       tasks[index].status = "queued"
       tasks[index].startedAt = nil
       tasks[index].finishedAt = nil

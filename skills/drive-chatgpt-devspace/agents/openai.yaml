@@ -1,4 +1,4 @@
 interface:
   display_name: "后台驱动 ChatGPT Devspace"
-  short_description: "在隐藏 Chat 页面驱动 devspace1、自动授权、读取可见思考并等待最终结果"
-  default_prompt: "Use $drive-chatgpt-devspace to run this task through a hidden ChatGPT Chat session with devspace1, verify every send stage, auto-approve cards, stream visible progress, and after 3 hours without visible progress start a fresh Chat while leaving the old response running; validate only after the final reply."
+  short_description: "在插件自有的可见或隐藏 Chat 页面驱动 devspace1、自动授权并编排工作与规划会话"
+  default_prompt: "Use $drive-chatgpt-devspace to run this task through a plugin-owned visible or hidden ChatGPT Chat session with devspace1, verify every send stage, auto-approve cards, stream visible progress, send each natural work result to a fresh planner Chat, and after 3 hours without visible progress close the old plugin Chat and continue in a fresh one; validate only after the planner's final reply."

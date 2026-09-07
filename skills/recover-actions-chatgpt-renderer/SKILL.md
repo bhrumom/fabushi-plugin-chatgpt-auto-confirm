@@ -86,7 +86,9 @@ that card and then verify the card's confirmed state; a click event alone is not
 success. Do not click arbitrary buttons on a page whose surface or
 authentication state is uncertain.
 
-The final hidden-Chat verification remains the native login/Chat-surface check.
+The final plugin-Chat verification remains the native login/Chat-surface check;
+the renderer may be visible or hidden, and ownership must never be inferred from
+visibility alone.
 A successful renderer probe is a prerequisite, not a replacement for
 authentication. Keep the existing rejection of real login pages and the
 existing credential-sync path.

@@ -8,7 +8,9 @@ import {
   BROWSER_CAPABILITY,
   MAX_PARALLEL_BROWSER_JOBS,
   promptForGoal,
+  plannerPromptForGoal,
   COMPLETION_CERTIFICATE_INSTRUCTION,
+  parseTaskReport,
   parseCompletionCertificate,
   classifyCompletion,
   validateBrowserPolicy,
@@ -27,25 +29,42 @@ test('in-app Browser policy is fixed to the authorized Chat surface', () => {
   assert.equal(BROWSER_DISPATCH_POLICY.model, 'GPT-5.6 Sol');
   assert.equal(BROWSER_DISPATCH_POLICY.reasoning, 'Extra High');
   assert.equal(BROWSER_DISPATCH_POLICY.surface, 'chat');
-  assert.equal(BROWSER_DISPATCH_POLICY.goalOnlyDispatch, true);
+  assert.equal(BROWSER_DISPATCH_POLICY.goalOnlyDispatch, false);
   assert.equal(BROWSER_DISPATCH_POLICY.maxConcurrentJobs, MAX_PARALLEL_BROWSER_JOBS);
   assert.deepEqual(validateBrowserPolicy({ ...BROWSER_DISPATCH_POLICY }), { ok: true });
   assert.equal(validateBrowserPolicy({ ...BROWSER_DISPATCH_POLICY, connector: 'devspace1' }).ok, false);
   assert.equal(validateBrowserPolicy({ ...BROWSER_DISPATCH_POLICY, previousProgress: 'must not be sent' }).ok, false);
 });
 
-test('goal prompt requires a machine-readable completion certificate', () => {
+test('work prompts stay natural while a fresh planner receives the machine-readable certificate', () => {
   const prompt = promptForGoal('完成 RustDesk 融合');
-  assert.match(prompt, /^完成 RustDesk 融合\n\n完成整个目标后/);
+  assert.match(prompt, /^完成 RustDesk 融合\n\n本轮是工作 Chat/);
   assert.doesNotMatch(prompt, /原始目标：/);
   assert.doesNotMatch(prompt, /内部自行拆解工作/);
-  assert.match(prompt, /MAHAYANA_TASK_REPORT_V1_BEGIN/);
-  assert.match(prompt, /"all_tasks_complete":true/);
-  assert.match(prompt, /"remaining":\[\]/);
-  assert.match(prompt, /"blockers":\[\]/);
-  assert.match(prompt, /"next_task":""/);
-  assert.equal(prompt.includes(COMPLETION_CERTIFICATE_INSTRUCTION), true);
+  assert.doesNotMatch(prompt, /MAHAYANA_TASK_REPORT_V1/);
+  const planner = plannerPromptForGoal('完成 RustDesk 融合', '工作 Chat 已完成代码修改，但还需要 CI。', {
+    taskId: 'task-1', appliedRevision: 2, appliedDigest: 'sha256:abc',
+  });
+  assert.match(planner, /MAHAYANA_TASK_REPORT_CONTRACT_V6/);
+  assert.match(planner, /MAHAYANA_TASK_REPORT_V1_BEGIN/);
+  assert.match(planner, /"task_id":"task-1"/);
+  assert.match(planner, /"applied_task_revision":2/);
+  assert.match(planner, /"applied_spec_digest":"sha256:abc"/);
+  assert.equal(planner.includes(COMPLETION_CERTIFICATE_INSTRUCTION), true);
   assert.doesNotMatch(prompt, /previousProgress/);
+});
+
+test('planner reports can arrange another work Chat without being mistaken for completion', () => {
+  const report = parseTaskReport([
+    'planner review',
+    'MAHAYANA_TASK_REPORT_V1_BEGIN',
+    '{"protocol":"mahayana.task-report.v1","status":"incomplete","all_tasks_complete":false,"summary":"CI 尚未完成","completed":["代码已修改"],"remaining":["CI"],"blockers":[],"verification":["diff"],"wait_seconds":0,"wait_reason":"","next_connector":"GitHub","next_task":"在 GitHub Actions 中完成 CI，并回读失败日志。"}',
+    'MAHAYANA_TASK_REPORT_V1_END',
+  ].join('\n'));
+  assert.equal(report.valid, true);
+  assert.equal(report.complete, false);
+  assert.equal(report.actionable, true);
+  assert.equal(report.payload.next_task.includes('GitHub Actions'), true);
 });
 
 test('completion parser stops only on the complete certificate shape', () => {

@@ -53,7 +53,7 @@ for (const task of state.automationTasks || []) {
       task.reviewFeedback = [task.reviewFeedback, note].filter(Boolean).join('\n\n');
     } else {
       // Keep both the active state and durable Chat identity across hosted
-      // runner rotation. monitorAutomationTask recreates only the hidden
+      // runner rotation. monitorAutomationTask recreates only the exact
       // renderer, navigates back to this conversation, confirms pending
       // authorization, and observes its real terminal state.
       // Refresh only the handoff heartbeat so the startup watchdog does not
