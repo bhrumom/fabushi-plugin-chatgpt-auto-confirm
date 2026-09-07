@@ -2503,6 +2503,13 @@ func prepareNewChatTarget(
       let blankConversation = allowBlankConversationReuse &&
         baselineWasBlank &&
         (prepared?["messageCount"] as? Int ?? 1) == 0
+      // Some desktop builds retain the portal id of an empty shell until the
+      // first outbound message. Because this path already verified an exact
+      // New Chat click and the old composer was blank, a stable blank composer
+      // is sufficient fresh-chat evidence without ever reusing a conversation
+      // that contains user or assistant content.
+      let blankAfterExplicitNewChat = baselineWasBlank &&
+        (prepared?["messageCount"] as? Int ?? 1) == 0
       // Current ChatGPT builds do not allocate a local conversation id until
       // the first message is dispatched. A verified New Chat click followed
       // by a stable, empty Chat composer is therefore a fresh conversation
@@ -2516,7 +2523,8 @@ func prepareNewChatTarget(
       // a correctly created blank Chat forever.
       let composerReady = (prepared?["inputTextLength"] as? Int ?? 1) == 0
       let candidateReady = composerReady &&
-        (changed || blankConversation || unmaterializedBlankConversation)
+        (changed || blankConversation || unmaterializedBlankConversation
+          || blankAfterExplicitNewChat)
       if candidateReady && stableConversationId == conversationId {
         stableSamples += 1
       } else if candidateReady {
@@ -2532,6 +2540,7 @@ func prepareNewChatTarget(
       if stableSamples >= 3 {
         var result = prepared ?? [:]
         result["newChatClicked"] = true
+        result["freshBlankAfterNewChat"] = blankAfterExplicitNewChat
         result["stableSamples"] = stableSamples
         return result
       }
