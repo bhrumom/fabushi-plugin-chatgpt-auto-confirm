@@ -9,7 +9,6 @@ import {
   MAX_PARALLEL_BROWSER_JOBS,
   promptForGoal,
   plannerPromptForGoal,
-  COMPLETION_CERTIFICATE_INSTRUCTION,
   parseTaskReport,
   parseCompletionCertificate,
   classifyCompletion,
@@ -50,7 +49,7 @@ test('work prompts stay natural while a fresh planner receives the machine-reada
   assert.match(planner, /"task_id":"task-1"/);
   assert.match(planner, /"applied_task_revision":2/);
   assert.match(planner, /"applied_spec_digest":"sha256:abc"/);
-  assert.equal(planner.includes(COMPLETION_CERTIFICATE_INSTRUCTION), true);
+  assert.equal(planner.includes('MAHAYANA_TASK_REPORT_V1_END'), true);
   assert.doesNotMatch(prompt, /previousProgress/);
 });
 
