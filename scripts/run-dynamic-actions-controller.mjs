@@ -114,8 +114,8 @@ const fetchControl = () => {
 
 const workDispatchBoundary = `
 本轮是工作 Chat：请直接执行以上目标，并在回复中给出自然语言工作结果。
-不要输出 MAHAYANA_TASK_REPORT_V1，也不要输出完成回执、未完成回执或下一步模板。
-插件会把本轮自然结果交给新的规划/验收 Chat；只有规划/验收 Chat 才能输出 MAHAYANA_TASK_REPORT_V1，并由插件把其中的 next_task 原文交给下一轮新的工作 Chat。
+不要输出规划/验收 Chat 的固定回执、完成回执、未完成回执或下一步模板。
+插件会把本轮自然结果交给新的规划/验收 Chat；只有规划/验收 Chat 才负责固定回执，并由插件把其中的 next_task 原文交给下一轮新的工作 Chat。
 `;
 
 const normalizedDirectory = value => String(value || '')

@@ -105,10 +105,10 @@ func continuationFromTaskReport(
     if !blockers.isEmpty {
       prompt += "\n\n需要处理的卡点：\n\(blockers)"
     }
-    prompt += "\n\n这是第 \(iteration) 轮续作。请直接执行以上安排，并在回复中给出自然语言结果；不要输出 MAHAYANA_TASK_REPORT_V1。"
+    prompt += "\n\n这是第 \(iteration) 轮续作。请直接执行以上安排，并在回复中给出自然语言结果；不要输出规划/验收 Chat 的固定回执或下一步模板。"
     return prompt
   }
-  return "请从同一 checkout 的最新落盘进度继续原始目标，先检查尚未完成的步骤并直接执行。第 \(iteration) 轮续作。只输出自然语言工作结果，不要输出 MAHAYANA_TASK_REPORT_V1。\n\n原始目标：\n\(messageWithoutTaskReportContract(originalGoal))"
+  return "请从同一 checkout 的最新落盘进度继续原始目标，先检查尚未完成的步骤并直接执行。第 \(iteration) 轮续作。只输出自然语言工作结果，不要输出规划/验收 Chat 的固定回执或下一步模板。\n\n原始目标：\n\(messageWithoutTaskReportContract(originalGoal))"
 }
 
 func relayFreshChatContinuation(_ params: [String: Any]) -> Never {

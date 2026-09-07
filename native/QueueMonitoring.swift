@@ -238,7 +238,7 @@ func queueContinuation(
     let waitReason = (report.waitReason ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     let sanitizedNextTask = messageWithoutTaskReportContract(report.nextTask)
       .trimmingCharacters(in: .whitespacesAndNewlines)
-    task.reviewFeedback = "规划/验收 Chat 判定任务未完成。请从同一 checkout 的现有进度继续，直接执行下面的 next_task；这是给 Work Chat 的自然语言安排，不要输出 MAHAYANA_TASK_REPORT_V1：\n\(sanitizedNextTask)\n\n上轮摘要：\(report.summary)\n剩余：\(report.remaining.joined(separator: "；"))\n卡点：\(report.blockers.joined(separator: "；"))"
+    task.reviewFeedback = "规划/验收 Chat 判定任务未完成。请从同一 checkout 的现有进度继续，直接执行下面的 next_task；这是给 Work Chat 的自然语言安排，不要输出规划/验收 Chat 的固定回执或下一步模板：\n\(sanitizedNextTask)\n\n上轮摘要：\(report.summary)\n剩余：\(report.remaining.joined(separator: "；"))\n卡点：\(report.blockers.joined(separator: "；"))"
     if requestedWait > 0 {
       let dueDate = Date().addingTimeInterval(Double(max(30, requestedWait)))
       task.waitingUntil = isoFormatter.string(from: dueDate)
@@ -254,7 +254,7 @@ func queueContinuation(
       task.lastError = reason
     }
   } else {
-    task.reviewFeedback = "规划/验收 Chat 没有给出有效的安排或完成证书（\(reason)）。请在新的 Work Chat 中重新读取同一 GitHub 仓库的项目文档和已落盘进度，只补做剩余步骤。Work Chat 只输出自然语言结果，不要输出 MAHAYANA_TASK_REPORT_V1。"
+    task.reviewFeedback = "规划/验收 Chat 没有给出有效的安排或完成证书（\(reason)）。请在新的 Work Chat 中重新读取同一 GitHub 仓库的项目文档和已落盘进度，只补做剩余步骤。Work Chat 只输出自然语言结果，不要输出规划/验收 Chat 的固定回执或下一步模板。"
     task.waitingUntil = nil
     task.waitReason = nil
     task.status = "queued"

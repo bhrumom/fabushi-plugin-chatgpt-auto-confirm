@@ -550,7 +550,7 @@ func automationTaskMessage(_ task: AutomationTask, forceFullGoal: Bool = false) 
   }
   if let reviewFeedback = task.reviewFeedback?.trimmingCharacters(in: .whitespacesAndNewlines),
      !reviewFeedback.isEmpty {
-    goal += "\n\n插件编排上下文（请直接执行，不要输出规划模板）：\n\(reviewFeedback)"
+    goal += "\n\n插件编排上下文（请直接执行，不要输出规划/验收 Chat 的固定回执或下一步模板）：\n\(reviewFeedback)"
   }
   // `forceFullGoal` is retained for persisted queue compatibility. Every Work
   // Chat now receives the executable goal and any planner handoff, but never a
@@ -714,7 +714,7 @@ func decodeLastJSONLine(at path: String?) -> (String, [String: Any])? {
   guard let path,
         let data = FileManager.default.contents(atPath: path),
         let text = String(data: data, encoding: .utf8) else { return nil }
-  for line in text.split(whereSeparator: \Character.isNewline).reversed() {
+  for line in text.split(whereSeparator: \.isNewline).reversed() {
     let raw = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
     guard let lineData = raw.data(using: .utf8),
           let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],

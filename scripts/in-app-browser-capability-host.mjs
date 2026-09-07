@@ -333,7 +333,7 @@ export function promptForGoal(goal, { role = 'work', workResult = '', ...metadat
     throw new Error('goal 必须是 1-10000 字符的非空目标文本');
   }
   if (role === 'planner') return plannerPromptForGoal(value, workResult, metadata);
-  return `${stripTaskReportContract(value)}\n\n本轮是工作 Chat：请直接执行以上目标，并在回复中给出自然语言工作结果。不要输出 MAHAYANA_TASK_REPORT_V1、完成回执、未完成回执或下一步模板。`;
+  return `${stripTaskReportContract(value)}\n\n本轮是工作 Chat：请直接执行以上目标，并在回复中给出自然语言工作结果。不要输出规划/验收 Chat 的固定回执、完成回执、未完成回执或下一步模板。`;
 }
 
 export function validateBrowserPolicy(policy) {

@@ -86,7 +86,7 @@ test('Work Chat stays natural while a fresh planner Chat owns the report protoco
   assert.match(controller, /工作 Chat/);
   assert.match(controller, /自然语言工作结果/);
   assert.match(controller, /新的规划\/验收 Chat/);
-  assert.match(controller, /只有规划\/验收 Chat 才能输出 MAHAYANA_TASK_REPORT_V1/);
+  assert.match(controller, /只有规划\/验收 Chat 才负责固定回执/);
   assert.match(controller, /next_task 原文交给下一轮新的工作 Chat/);
   assert.doesNotMatch(controller, /MAHAYANA_TASK_REPORT_CONTRACT_V5/);
   assert.doesNotMatch(controller, /MAHAYANA_TASK_REPORT_V1_BEGIN/);
