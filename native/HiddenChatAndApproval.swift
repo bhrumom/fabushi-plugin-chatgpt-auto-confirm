@@ -234,18 +234,50 @@ func terminatePluginChatProcess(profilePath: String) {
     terminateDedicatedChatProcess(profilePath: profilePath)
     return
   }
+  func removeStaleProfileLocks() {
+    // A crashed or force-terminated ChatGPT renderer can leave Chromium's
+    // singleton links and Default/LOCK behind. They belong only to this
+    // plugin-owned profile; removing them after the process list is empty
+    // lets the next retry mount the same authenticated profile without
+    // creating another app instance or deleting its cookies.
+    let staleLockPaths = [
+      "SingletonCookie",
+      "SingletonLock",
+      "SingletonSocket",
+      "RunningChromeVersion",
+      "Default/LOCK",
+    ]
+    let fileManager = FileManager.default
+    for relativePath in staleLockPaths {
+      let lockURL = URL(fileURLWithPath: profilePath, isDirectory: true)
+        .appendingPathComponent(relativePath)
+      // removeItem also handles dangling Singleton* symlinks, for which
+      // fileExists(atPath:) intentionally returns false.
+      try? fileManager.removeItem(at: lockURL)
+    }
+  }
   func liveIds() -> [pid_t] {
     pluginChatProcessIds(profilePath: profilePath).filter { watcherIsAlive($0) }
   }
   var processIds = liveIds()
+  if processIds.isEmpty {
+    removeStaleProfileLocks()
+    return
+  }
   for pid in processIds { _ = kill(pid, SIGTERM) }
   let gracefulDeadline = Date().addingTimeInterval(2.0)
   while Date() < gracefulDeadline {
     processIds = liveIds()
-    if processIds.isEmpty { return }
+    if processIds.isEmpty {
+      removeStaleProfileLocks()
+      return
+    }
     Thread.sleep(forTimeInterval: 0.1)
   }
   for pid in liveIds() { _ = kill(pid, SIGKILL) }
+  if liveIds().isEmpty {
+    removeStaleProfileLocks()
+  }
 }
 
 @discardableResult
