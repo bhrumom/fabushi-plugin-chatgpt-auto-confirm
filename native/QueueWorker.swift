@@ -34,19 +34,26 @@ enum QueueTargetRuntimeState {
   case suspended
 }
 
-// A hosted GitHub Actions runner has no user-facing ChatGPT window. Keep the
-// dedicated process private to its copied profile, but do not make bootstrap
-// depend on macOS successfully applying a hidden/occluded lifecycle state.
-// Desktop runs remain fail-closed when a renderer is genuinely visible.
+// The plugin owns a dedicated Chat target, but macOS may report that target as
+// visible after a renderer remount. Visibility is therefore diagnostic rather
+// than a hard requirement. Set REQUIRE_HIDDEN only for an explicitly strict
+// deployment that wants the old policy; the normal local path accepts either
+// visible or hidden Chat surfaces.
 func queueAllowsVisibleDedicatedRenderer() -> Bool {
   let environment = ProcessInfo.processInfo.environment
+  let requireHidden = environment["CHATGPT_AUTO_CONFIRM_REQUIRE_HIDDEN"]?
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+    .lowercased()
+  if requireHidden == "1" || requireHidden == "true" {
+    return false
+  }
   let explicit = environment["CHATGPT_AUTO_CONFIRM_HEADLESS"]?
     .trimmingCharacters(in: .whitespacesAndNewlines)
     .lowercased()
-  if explicit == "1" || explicit == "true" {
-    return true
+  if explicit == "0" || explicit == "false" {
+    return false
   }
-  return environment["GITHUB_ACTIONS"]?.lowercased() == "true"
+  return true
 }
 
 func runningOnGitHubActions() -> Bool {
@@ -300,9 +307,8 @@ func queueTargetStateIsUsableForQueue(
           || workerMode == parallelHeadlessWindowQueueWorkerMode
           // The shared controller fallback deliberately borrows the primary
           // renderer after proving it is a real Chat surface. It is reachable
-          // only when queueAllowsVisibleDedicatedRenderer() has been explicitly
-          // enabled (or on GitHub Actions), and shared mode prevents task
-          // cleanup from closing that borrowed renderer.
+          // accepted by the normal visibility policy, and shared mode prevents
+          // task cleanup from closing that borrowed renderer.
           || workerMode == sharedConversationQueueWorkerMode
       )
   case .missing, .hiddenNonChat, .suspended:
@@ -388,8 +394,13 @@ func queueTargetRuntimeState(
     expression: expression,
     timeout: 3.0
   )
+  func probeIsChat(_ value: [String: Any]?) -> Bool {
+    (value?["chatMode"] as? NSNumber)?.boolValue == true
+      && value?["surface"] as? String == "chat"
+  }
   if initial?["visibility"] as? String == "visible",
-     !dedicatedProcessIsHiddenForPort(port) {
+     !dedicatedProcessIsHiddenForPort(port),
+     probeIsChat(initial) {
     return .visible
   }
   if refreshLifecycle {
@@ -399,7 +410,8 @@ func queueTargetRuntimeState(
     ? cdpValue(port: port, targetId: targetId, expression: expression, timeout: 3.0)
     : initial
   if probe?["visibility"] as? String == "visible",
-     !dedicatedProcessIsHiddenForPort(port) {
+     !dedicatedProcessIsHiddenForPort(port),
+     probeIsChat(probe) {
     return .visible
   }
   let bridge = (probe?["bridge"] as? NSNumber)?.boolValue ?? false
@@ -439,8 +451,10 @@ func queueTargetIsHidden(port: Int, targetId: String) -> Bool {
 
 func queueTargetIsReady(port: Int, targetId: String) -> Bool {
   switch queueTargetRuntimeState(port: port, targetId: targetId, refreshLifecycle: true) {
-  case .hidden, .visible:
+  case .hidden:
     return true
+  case .visible:
+    return queueAllowsVisibleDedicatedRenderer()
   case .missing, .hiddenNonChat, .suspended:
     return false
   }
@@ -998,9 +1012,9 @@ func openBackgroundQueueWindow(
   return nil
 }
 
-// The quick-chat prewarm RPC owns one show:false BrowserWindow and clears the
-// previous prewarm whenever it creates the next one. That contract is correct
-// for the legacy single hidden worker, but it cannot back two overlapping
+// The quick-chat prewarm RPC owns one plugin BrowserWindow and clears the
+// previous prewarm whenever it creates the next one. That contract is useful
+// for the legacy single-worker path, but it cannot back two overlapping
 // Actions tasks. Headless runners can ask Chromium/Electron for independent
 // normal BrowserWindows directly; the authenticated app process and preload
 // bridge are shared, while each target remains queue-owned and isolated.
@@ -2404,15 +2418,15 @@ func createQueueWorkerTarget(
   _ state: inout PluginState,
   reuseExisting: Bool = true
 ) -> (port: Int, targetId: String, profilePath: String)? {
-  // A compatibility caller may reuse the plugin-owned hidden Chat renderer.
+  // A compatibility caller may reuse the plugin-owned Chat renderer.
   // Parallel task dispatch always passes reuseExisting=false so every running
-  // task owns a different hidden BrowserWindow and never has to navigate away
+  // task owns a different Chat renderer and never has to navigate away
   // from another task while that Chat is streaming.
   if reuseExisting,
      let port = state.queueWorkerPort,
      let targetId = state.queueWorkerTargetId,
      queueUsesBackgroundWindow(state),
-     queueTargetIsHidden(port: port, targetId: targetId) {
+     queueTargetIsReady(port: port, targetId: targetId) {
     return (port, targetId, state.queueWorkerProfilePath ?? "")
   }
   if reuseExisting {
@@ -2452,11 +2466,7 @@ func createQueueWorkerTarget(
     guard target["type"] as? String == "page",
           (target["url"] as? String ?? "") == "app://-/index.html",
           let targetId = target["id"] as? String,
-          queueTargetRuntimeState(
-            port: port,
-            targetId: targetId,
-            refreshLifecycle: true
-          ) == .hidden else { continue }
+          queueTargetIsReady(port: port, targetId: targetId) else { continue }
     let prepared = cdpValue(
       port: port,
       targetId: targetId,
@@ -2476,9 +2486,8 @@ func createQueueWorkerTarget(
 
   // A fresh runner normally has only ChatGPT's visible primary window.
   // Ask that authenticated renderer's official quick-chat service to create
-  // the show:false prewarm BrowserWindow, then turn it into the queue-owned
-  // hidden Chat surface. Previously this implementation existed but was never
-  // called, so the queue could only reuse a hidden target created elsewhere.
+  // a queue-owned Chat BrowserWindow. The resulting target may be visible or
+  // hidden; readiness is decided by exact ownership and Chat-surface checks.
   var prewarmFailure: String?
   queueTrace("worker-create stage=new-hidden-window begin")
   if let controller = sharedChatController(&state),
@@ -2892,9 +2901,9 @@ func createSharedControllerQueueWorkerTarget(
   _ state: inout PluginState
 ) -> (port: Int, targetId: String, profilePath: String)? {
   // A single-task runner may use the already authenticated primary renderer
-  // while no task is running. Local desktop fallback is allowed only after
-  // the dedicated controller is verified hidden; Actions/headless runners may
-  // also accept a visible renderer because they have no user-facing window.
+  // while no task is running. Local desktop fallback is allowed after the
+  // controller is verified as a plugin-owned Chat target. Its renderer may be
+  // visible or hidden; visibility is telemetry, not the ownership boundary.
   // Mark it shared so cleanup never closes ChatGPT's primary window.
   guard !(state.automationTasks ?? []).contains(where: { $0.status == "running" }),
         var controller = sharedChatController(&state) else {
@@ -3214,7 +3223,8 @@ func createIndependentQueueWorkerTarget(
     return worker
   }
   // Reuse the authenticated ChatGPT desktop process and ask its official
-  // prewarm service to create a fresh hidden app renderer.
+  // prewarm service to create a fresh plugin-owned app renderer. It may be
+  // reported as visible or hidden; the exact Chat target remains the boundary.
   if let worker = createQueueWorkerTarget(&state, reuseExisting: false) {
     state.queueWorkerMode = parallelHiddenWindowQueueWorkerMode
     return worker
@@ -3225,7 +3235,7 @@ func createIndependentQueueWorkerTarget(
   )
 
   // Tasks imported before account routing was introduced may not have an
-  // accountId. They still run inside the already prepared, hidden ChatGPT
+  // accountId. They still run inside the already prepared, plugin-owned ChatGPT
   // controller. When the official quick-chat prewarm renderer lands on its
   // transient error page, recover through that authenticated controller just
   // like an explicitly assigned local task instead of failing before the
@@ -3247,7 +3257,7 @@ func createIndependentQueueWorkerTarget(
 }
 
 func stopQueueWorker(_ state: inout PluginState) {
-  // Close only queue-owned hidden windows. The primary window and the shared
+  // Close only queue-owned plugin windows. The primary window and the shared
   // ChatGPT process remain available to the user and the general confirmer.
   if state.queueWorkerMode == parallelDedicatedProcessQueueWorkerMode {
     for task in state.automationTasks ?? [] {
@@ -3268,14 +3278,14 @@ func stopQueueWorker(_ state: inout PluginState) {
     let taskTargets = Set((state.automationTasks ?? []).compactMap { task -> String? in
       guard let port = task.workerPort,
             let targetId = task.workerTargetId,
-            queueTargetIsHidden(port: port, targetId: targetId) else { return nil }
+            queueTargetIsReady(port: port, targetId: targetId) else { return nil }
       _ = CDPClient.closeTarget(targetId, portOverride: port)
       return targetId
     })
     if let targetId = state.queueWorkerTargetId,
        !taskTargets.contains(targetId),
        let port = state.queueWorkerPort,
-       queueTargetIsHidden(port: port, targetId: targetId) {
+       queueTargetIsReady(port: port, targetId: targetId) {
       _ = CDPClient.closeTarget(targetId, portOverride: port)
     }
   } else if state.queueWorkerMode == parallelHeadlessWindowQueueWorkerMode {
@@ -3307,9 +3317,10 @@ func startAutomationTask(
   _ task: inout AutomationTask,
   state: inout PluginState
 ) throws {
-  // Each parallel task owns a fresh hidden Chat BrowserWindow inside the same
-  // authenticated ChatGPT process. This preserves the proven real Chat UI path
-  // without navigating away from another task's streaming conversation.
+  // Each parallel task owns a fresh plugin Chat BrowserWindow inside the same
+  // authenticated ChatGPT process. The window may be visible or hidden; exact
+  // target ownership and the Chat surface preserve isolation without
+  // navigating away from another task's streaming conversation.
   var prepared: [String: Any]?
   var preparationFailure: String?
   var port: Int?
@@ -3319,7 +3330,7 @@ func startAutomationTask(
   // Normal task rounds branch from the latest task conversation. A dispatch
   // that created a user bubble but never produced any assistant/tool activity
   // has no response turn to branch from, so recovery must create a genuinely
-  // fresh Chat while leaving the stalled Chat untouched.
+  // fresh Chat.
   let freshChatRecoveryReasons = ["chat_start_no_reply", "page_stalled"]
   let requiresFreshRecoveryChat = freshChatRecoveryReasons.contains(task.lastError ?? "")
   var forceFullGoalPrompt = requiresFreshRecoveryChat
@@ -3327,29 +3338,28 @@ func startAutomationTask(
     ? nil
     : normalizedConversationId(task.conversationId)
   defer {
-    if !taskOwnsTarget,
-       state.queueWorkerMode != sharedConversationQueueWorkerMode,
-       let port, let targetId {
-      _ = CDPClient.closeTarget(targetId, portOverride: port)
-    }
-    if !taskOwnsTarget, let workerProfilePath {
-      terminateDedicatedChatProcess(profilePath: workerProfilePath)
+    if !taskOwnsTarget {
+      if let port, let targetId,
+         state.queueWorkerMode != sharedConversationQueueWorkerMode
+           || pluginOwnsBackgroundTarget(port: port, targetId: targetId, state: state) {
+        _ = CDPClient.closeTarget(targetId, portOverride: port)
+      }
+      if let workerProfilePath {
+        terminatePluginChatProcess(profilePath: workerProfilePath)
+      }
     }
   }
-  let preserveStalledChat = [
-    "chat_start_no_reply", "page_stalled", "page_stalled_but_response_active",
-  ].contains(task.lastError ?? "")
-  if !preserveStalledChat,
-     state.queueWorkerMode == parallelDedicatedProcessQueueWorkerMode,
-     let staleProfilePath = task.workerProfilePath {
-    terminateDedicatedChatProcess(profilePath: staleProfilePath)
-  } else if !preserveStalledChat,
-            (state.queueWorkerMode == parallelHiddenWindowQueueWorkerMode
-              || state.queueWorkerMode == parallelHeadlessWindowQueueWorkerMode),
-            let staleTargetId = task.workerTargetId,
-            let stalePort = task.workerPort,
-     queueTargetIsReady(port: stalePort, targetId: staleTargetId) {
+  // Every retry/recovery closes the prior plugin-owned renderer first. Keeping
+  // a stalled Chat alive made repeated retries accumulate windows and allowed
+  // a late response from an old round to remain visible to the controller.
+  if let staleTargetId = task.workerTargetId,
+     let stalePort = task.workerPort,
+     state.queueWorkerMode != sharedConversationQueueWorkerMode
+       || pluginOwnsBackgroundTarget(port: stalePort, targetId: staleTargetId, state: state) {
     _ = CDPClient.closeTarget(staleTargetId, portOverride: stalePort)
+  }
+  if let staleProfilePath = task.workerProfilePath {
+    terminatePluginChatProcess(profilePath: staleProfilePath)
   }
   task.workerPort = nil
   task.workerTargetId = nil
@@ -3438,26 +3448,6 @@ func startAutomationTask(
         + "newConversation=\(prepared?["conversationId"] as? String ?? "none") "
         + "error=\(prepared?["error"] as? String ?? "none")"
     )
-    if prepared?["ok"] as? Bool != true, preserveStalledChat {
-      let firstError = prepared?["error"] as? String ?? "continuation_no_result"
-      queueTrace(
-        "task=\(task.id) stage=prepare-continuation branch-retry-after-stall "
-          + "reason=\(firstError)"
-      )
-      _ = cdpValue(
-        port: worker.port,
-        targetId: worker.targetId,
-        expression: stopCurrentResponseJS(),
-        timeout: 15.0
-      )
-      Thread.sleep(forTimeInterval: 0.8)
-      prepared = cdpValue(
-        port: worker.port,
-        targetId: worker.targetId,
-        expression: continueInNewTaskJS(expectedConversationId: continuationConversationId),
-        timeout: 35.0
-      )
-    }
     if prepared?["ok"] as? Bool != true {
       let continuationError = prepared?["error"] as? String ?? "continuation_no_result"
       let assistantResponseCount = prepared?["assistantResponseCount"] as? Int ?? -1
@@ -3466,10 +3456,10 @@ func startAutomationTask(
         // A dispatch that created only a user bubble has no assistant turn to
         // branch from. Operator recovery may replace task.lastError, so use the
         // live CDP result as the source of truth and create a genuinely fresh
-        // Chat while leaving the unanswered conversation untouched.
+        // Chat; the stale renderer was already closed before this retry.
         queueTrace(
           "task=\(task.id) stage=prepare-continuation no-assistant-response "
-            + "action=prepare-fresh-chat oldChat=preserved"
+            + "action=prepare-fresh-chat oldChat=closed"
         )
         prepared = prepareNewChatTarget(
           port: worker.port,
@@ -3504,12 +3494,6 @@ func startAutomationTask(
       }
     }
   } else {
-    if preserveStalledChat {
-      queueTrace(
-        "task=\(task.id) stage=prepare-fresh-chat-after-stall "
-          + "previousConversation=\(previousConversationId ?? "none") oldChat=preserved"
-      )
-    }
     queueTrace("task=\(task.id) stage=prepare-new-chat begin")
     prepared = prepareNewChatTarget(
       port: worker.port,
@@ -3552,16 +3536,15 @@ func startAutomationTask(
   task.dispatchMarkerVerifiedAt = nil
   task.dispatchLocalConversationId = nil
   task.attachedConversationWithoutDispatchMarker = nil
-  let outbound = messageWithTaskReportContract(
-    automationTaskMessage(task, forceFullGoal: forceFullGoalPrompt),
-    taskId: task.id,
-    appliedRevision: task.currentRevision,
-    appliedDigest: task.specDigest
-  )
+  let dispatchMarker = "任务发送轮次：\(attempt)"
+  // Work Chats are deliberately natural-output sessions. The dispatch marker
+  // is a small controller-only identity token used to bind the live reply to
+  // this attempt; it is not a completion/report template.
+  let outbound = automationTaskMessage(task, forceFullGoal: forceFullGoalPrompt)
+    + "\n\n插件调度标记：\(dispatchMarker)"
   task.appliedRevision = max(1, task.currentRevision ?? 1)
   task.appliedSpecDigest = task.specDigest
   task.pendingRevision = nil
-  let dispatchMarker = "任务发送轮次：\(attempt)"
   queueTrace("task=\(task.id) stage=send begin")
   guard let sendResult = cdpValue(
     port: port,
@@ -3845,29 +3828,25 @@ func stopAutomationWorker(_ task: AutomationTask, state: PluginState) {
      let pid = workerState.watcherPid {
     kill(pid, SIGTERM)
   }
-  if state.queueWorkerMode != sharedConversationQueueWorkerMode,
-     let targetId = task.workerTargetId {
-    _ = CDPClient.closeTarget(targetId, portOverride: task.workerPort)
-  }
-  if let profilePath = task.workerProfilePath {
-    terminateDedicatedChatProcess(profilePath: profilePath)
-  }
+  closeDedicatedAutomationTarget(task, state: state)
 }
 
 func closeDedicatedAutomationTarget(
   _ task: AutomationTask,
   state: PluginState
 ) {
-  // Parallel tasks own separate hidden windows, so a task may close only the
-  // target recorded on that task. Keep the legacy shared-renderer guard for
-  // queues created by an older runtime during migration.
-  if state.queueWorkerMode != sharedConversationQueueWorkerMode,
-     let targetId = task.workerTargetId {
-    _ = CDPClient.closeTarget(targetId, portOverride: task.workerPort)
+  // A task may close only the exact target recorded on that task. A shared
+  // queue renderer is closable only when it is also proven to be the plugin's
+  // own target; a borrowed user renderer remains untouched.
+  if let targetId = task.workerTargetId,
+     let port = task.workerPort,
+     state.queueWorkerMode != sharedConversationQueueWorkerMode
+       || pluginOwnsBackgroundTarget(port: port, targetId: targetId, state: state) {
+    _ = CDPClient.closeTarget(targetId, portOverride: port)
   }
-  if state.queueWorkerMode == parallelDedicatedProcessQueueWorkerMode,
-     let profilePath = task.workerProfilePath {
-    terminateDedicatedChatProcess(profilePath: profilePath)
+  if let profilePath = task.workerProfilePath,
+     pluginOwnedProfilePath(profilePath) {
+    terminatePluginChatProcess(profilePath: profilePath)
   }
 }
 

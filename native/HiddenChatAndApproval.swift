@@ -4,20 +4,110 @@ import Darwin
 import Foundation
 import SystemConfiguration
 
-func loadedApprovalTargets(_ state: PluginState) -> [CDPApprovalTarget] {
-  // The general watcher may act only on the exact renderer it created and
-  // proved hidden. Scanning the primary debugging endpoint also included the
-  // user's visible Chat, so startup could click controls on the displayed page
-  // while still reporting `backgroundOnly=true`.
-  // Runtime.evaluate does not activate the app, but renderer ownership and
-  // hidden-window state are still mandatory before any page script may run.
+func canonicalPluginPath(_ rawPath: String) -> String {
+  URL(fileURLWithPath: rawPath, isDirectory: true).standardizedFileURL.path
+}
+
+func pluginOwnedProfilePath(_ rawPath: String?) -> Bool {
+  guard let rawPath,
+        !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    return false
+  }
+  let candidate = canonicalPluginPath(rawPath)
+  let exactProfiles = [
+    hiddenChatProfilePath(),
+    configuredHiddenChatProfilePath(),
+  ].compactMap { $0 }.map(canonicalPluginPath)
+  if exactProfiles.contains(candidate) { return true }
+
+  let roots = [
+    accountsRootURL().standardizedFileURL.path,
+    queueDirectoryURL().appendingPathComponent("workers", isDirectory: true)
+      .standardizedFileURL.path,
+  ]
+  return roots.contains { root in
+    candidate == root || candidate.hasPrefix(root + "/")
+  }
+}
+
+func pluginProfilePathForPort(_ port: Int) -> String? {
+  let process = Process()
+  let output = Pipe()
+  process.executableURL = URL(fileURLWithPath: "/bin/ps")
+  process.arguments = ["-axo", "pid=,command="]
+  process.standardInput = FileHandle.nullDevice
+  process.standardOutput = output
+  process.standardError = FileHandle.nullDevice
+  let data: Data
+  do {
+    try process.run()
+    data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+  } catch {
+    return nil
+  }
+  guard let text = String(data: data, encoding: .utf8) else { return nil }
+  let portMarker = "--remote-debugging-port=\(port)"
+  for lineSlice in text.split(separator: "\n") {
+    let line = String(lineSlice)
+    guard line.contains("/Applications/ChatGPT.app/Contents/"),
+          line.contains(portMarker),
+          let profileRange = line.range(of: "--user-data-dir=") else { continue }
+    let profileTail = line[profileRange.upperBound...]
+    let profile = profileTail.range(of: " --").map {
+      String(profileTail[..<$0.lowerBound])
+    } ?? String(profileTail)
+    let normalized = profile.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !normalized.isEmpty { return canonicalPluginPath(normalized) }
+  }
+  return nil
+}
+
+func pluginOwnsBackgroundTarget(
+  port: Int,
+  targetId: String,
+  state: PluginState
+) -> Bool {
+  guard state.backgroundAppPort == port,
+        state.backgroundChatTargetId == targetId else { return false }
+  let allowTestTarget = ProcessInfo.processInfo.environment[
+    "CHATGPT_AUTO_CONFIRM_ALLOW_TEST_WEB_TARGET"
+  ] == "1"
+  // The test seam may deliberately use the primary mock endpoint. Production
+  // must never attach the plugin controller to the user's primary renderer just
+  // because both endpoints happen to expose a Chat page.
+  if port == CDPClient.port() && !allowTestTarget { return false }
+  if allowTestTarget && port == CDPClient.port() { return true }
+  guard pluginOwnedProfilePath(state.backgroundProfilePath) else { return false }
+  guard let activeProfile = pluginProfilePathForPort(port) else { return false }
+  return canonicalPluginPath(activeProfile)
+    == canonicalPluginPath(state.backgroundProfilePath ?? "")
+}
+
+func pluginBackgroundRuntimeState(_ state: PluginState) -> QueueTargetRuntimeState? {
   guard let port = state.backgroundAppPort,
         let targetId = state.backgroundChatTargetId,
-        queueTargetRuntimeState(
-          port: port,
-          targetId: targetId,
-          refreshLifecycle: false
-        ) == .hidden,
+        pluginOwnsBackgroundTarget(port: port, targetId: targetId, state: state) else {
+    return nil
+  }
+  return queueTargetRuntimeState(
+    port: port,
+    targetId: targetId,
+    refreshLifecycle: false
+  )
+}
+
+func loadedApprovalTargets(_ state: PluginState) -> [CDPApprovalTarget] {
+  // The watcher may act only on the exact renderer recorded by the plugin. Its
+  // window may be visible or hidden; ownership and the real Chat surface are
+  // the safety boundary, while visibility is reported as telemetry.
+  guard let port = state.backgroundAppPort,
+        let targetId = state.backgroundChatTargetId,
+        pluginOwnsBackgroundTarget(port: port, targetId: targetId, state: state),
+        let runtimeState = pluginBackgroundRuntimeState(state),
+        runtimeState == .hidden || (
+          queueAllowsVisibleDedicatedRenderer() && runtimeState == .visible
+        ),
         let target = CDPClient.fetchTargets(portOverride: port).first(where: {
           $0["id"] as? String == targetId && isLoadedApprovalRendererTarget($0)
         }) else { return [] }
@@ -80,9 +170,114 @@ func synchronizeBackgroundTargets(
 
 func closeBackgroundTargets(_ state: inout PluginState) {
   for targetId in (state.backgroundTargets ?? [:]).values {
-    _ = CDPClient.closeTarget(targetId)
+    // These URLs are created through the primary CDP endpoint by
+    // synchronizeBackgroundTargets and are tracked by exact target id.
+    _ = CDPClient.closeTarget(targetId, portOverride: CDPClient.port())
+  }
+  if let port = state.backgroundAppPort,
+     let targetId = state.backgroundChatTargetId,
+     pluginOwnsBackgroundTarget(port: port, targetId: targetId, state: state) {
+    _ = CDPClient.closeTarget(targetId, portOverride: port)
+  }
+  if let profilePath = state.backgroundProfilePath,
+     pluginOwnedProfilePath(profilePath) {
+    terminatePluginChatProcess(profilePath: profilePath)
   }
   state.backgroundTargets = [:]
+  state.backgroundAppPort = nil
+  state.backgroundChatTargetId = nil
+  state.backgroundProfilePath = nil
+  state.backgroundCodexHomePath = nil
+  state.backgroundConversationId = nil
+}
+
+func pluginChatProcessIds(profilePath: String) -> [pid_t] {
+  guard pluginOwnedProfilePath(profilePath) else { return [] }
+  let canonicalProfile = canonicalPluginPath(profilePath)
+  let process = Process()
+  let output = Pipe()
+  process.executableURL = URL(fileURLWithPath: "/bin/ps")
+  process.arguments = ["-axo", "pid=,command="]
+  process.standardInput = FileHandle.nullDevice
+  process.standardOutput = output
+  process.standardError = FileHandle.nullDevice
+  let data: Data
+  do {
+    try process.run()
+    data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+  } catch {
+    return []
+  }
+  guard let text = String(data: data, encoding: .utf8) else { return [] }
+  let executableMarker = "/Applications/ChatGPT.app/Contents/"
+  let profileMarker = "--user-data-dir=\(canonicalProfile)"
+  let crashpadMarker = "--database=\(canonicalProfile)/Crashpad"
+  let ids = text.split(separator: "\n").compactMap { lineSlice -> pid_t? in
+    let line = String(lineSlice)
+    guard line.contains(executableMarker),
+          line.contains(profileMarker) || line.contains(crashpadMarker) else {
+      return nil
+    }
+    let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+    guard let first = fields.first, let pid = pid_t(String(first)), pid > 1, pid != getpid() else {
+      return nil
+    }
+    return pid
+  }
+  return Array(Set(ids)).sorted()
+}
+
+func terminatePluginChatProcess(profilePath: String) {
+  guard pluginOwnedProfilePath(profilePath) else { return }
+  if profilePath.contains("/task-queue/workers/") {
+    terminateDedicatedChatProcess(profilePath: profilePath)
+    return
+  }
+  func removeStaleProfileLocks() {
+    // A crashed or force-terminated ChatGPT renderer can leave Chromium's
+    // singleton links and Default/LOCK behind. They belong only to this
+    // plugin-owned profile; removing them after the process list is empty
+    // lets the next retry mount the same authenticated profile without
+    // creating another app instance or deleting its cookies.
+    let staleLockPaths = [
+      "SingletonCookie",
+      "SingletonLock",
+      "SingletonSocket",
+      "RunningChromeVersion",
+      "Default/LOCK",
+    ]
+    let fileManager = FileManager.default
+    for relativePath in staleLockPaths {
+      let lockURL = URL(fileURLWithPath: profilePath, isDirectory: true)
+        .appendingPathComponent(relativePath)
+      // removeItem also handles dangling Singleton* symlinks, for which
+      // fileExists(atPath:) intentionally returns false.
+      try? fileManager.removeItem(at: lockURL)
+    }
+  }
+  func liveIds() -> [pid_t] {
+    pluginChatProcessIds(profilePath: profilePath).filter { watcherIsAlive($0) }
+  }
+  var processIds = liveIds()
+  if processIds.isEmpty {
+    removeStaleProfileLocks()
+    return
+  }
+  for pid in processIds { _ = kill(pid, SIGTERM) }
+  let gracefulDeadline = Date().addingTimeInterval(2.0)
+  while Date() < gracefulDeadline {
+    processIds = liveIds()
+    if processIds.isEmpty {
+      removeStaleProfileLocks()
+      return
+    }
+    Thread.sleep(forTimeInterval: 0.1)
+  }
+  for pid in liveIds() { _ = kill(pid, SIGKILL) }
+  if liveIds().isEmpty {
+    removeStaleProfileLocks()
+  }
 }
 
 @discardableResult
@@ -769,7 +964,10 @@ func prepareBackgroundChatJS(
   return """
   (async () => {
     const result = {
-      ok: false, backgroundOnly: true, workerUsed: false,
+      ok: false,
+      backgroundOnly: document.visibilityState === 'hidden',
+      runtimeState: document.visibilityState === 'hidden' ? 'hidden' : 'visible',
+      workerUsed: false,
       newChatClicked: false, chatSelected: false, error: null,
       url: window.location.href || '', conversationId: null
     };
@@ -1217,6 +1415,38 @@ func clickChatJS() -> String {
         modeControls
       };
     }
+    // Current desktop builds expose an explicit top-level Chat/Work toggle.
+    // The shell can still expose a stale "current mode: ChatGPT" trigger while
+    // the composer belongs to Work. Prefer the real, unselected Chat tab before
+    // considering the compact-mode trigger or a Work-side "new conversation"
+    // button; otherwise the latter only creates another Work task and the
+    // plugin sender never reaches the Chat surface.
+    const explicitChatTab = modeTabs()
+      .filter(candidate => labelsFor(candidate).some(label => isChatLabel(label)))
+      .filter(candidate => !isSelected(candidate))
+      .filter(candidate => {
+        const role = normalize(candidate.getAttribute('role'));
+        return ['BUTTON', 'A'].includes(candidate.tagName)
+          || ['button', 'tab', 'menuitem', 'menuitemradio', 'option'].includes(role);
+      })
+      .sort((lhs, rhs) => modeTabScore(rhs) - modeTabScore(lhs))[0];
+    if (surface.workComposer && explicitChatTab) {
+      const rect = explicitChatTab.getBoundingClientRect();
+      setTimeout(() => {
+        try { dispatchPointerClick(explicitChatTab); } catch (_) {}
+      }, 0);
+      return {
+        ok: true,
+        chatSelected: true,
+        dispatchOnly: true,
+        nativeClickRecommended: true,
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        selectedLabel: labelsFor(explicitChatTab)[0] || 'chat',
+        surface,
+        modeControls
+      };
+    }
     const currentChatGPTMode = candidates().find(candidate =>
       labelsFor(candidate).some(label =>
         label.includes('current mode: chatgpt')
@@ -1326,7 +1556,8 @@ func clickChatJS() -> String {
     // Selecting ChatGPT can replace the renderer immediately. Dispatch the
     // click after this evaluation returns so a destroyed execution context is
     // not mistaken for a failed mode selection. The caller independently
-    // waits for and validates the resulting hidden Chat surface.
+    // waits for and validates the resulting plugin-owned Chat surface; it may
+    // be visible or hidden.
     const rect = button.getBoundingClientRect();
     setTimeout(() => {
       try { dispatchPointerClick(button); } catch (_) {}
@@ -2304,6 +2535,13 @@ func prepareNewChatTarget(
       let blankConversation = allowBlankConversationReuse &&
         baselineWasBlank &&
         (prepared?["messageCount"] as? Int ?? 1) == 0
+      // Some desktop builds retain the portal id of an empty shell until the
+      // first outbound message. Because this path already verified an exact
+      // New Chat click and the old composer was blank, a stable blank composer
+      // is sufficient fresh-chat evidence without ever reusing a conversation
+      // that contains user or assistant content.
+      let blankAfterExplicitNewChat = baselineWasBlank &&
+        (prepared?["messageCount"] as? Int ?? 1) == 0
       // Current ChatGPT builds do not allocate a local conversation id until
       // the first message is dispatched. A verified New Chat click followed
       // by a stable, empty Chat composer is therefore a fresh conversation
@@ -2317,7 +2555,8 @@ func prepareNewChatTarget(
       // a correctly created blank Chat forever.
       let composerReady = (prepared?["inputTextLength"] as? Int ?? 1) == 0
       let candidateReady = composerReady &&
-        (changed || blankConversation || unmaterializedBlankConversation)
+        (changed || blankConversation || unmaterializedBlankConversation
+          || blankAfterExplicitNewChat)
       if candidateReady && stableConversationId == conversationId {
         stableSamples += 1
       } else if candidateReady {
@@ -2333,6 +2572,7 @@ func prepareNewChatTarget(
       if stableSamples >= 3 {
         var result = prepared ?? [:]
         result["newChatClicked"] = true
+        result["freshBlankAfterNewChat"] = blankAfterExplicitNewChat
         result["stableSamples"] = stableSamples
         return result
       }
@@ -2355,19 +2595,40 @@ func ensureHiddenChatTarget(
   conversationId: String? = nil
 ) -> [String: Any]? {
   let port = hiddenChatPort(state)
-  let profilePath = configuredHiddenChatProfilePath()
-    ?? state.backgroundProfilePath
-    ?? hiddenChatProfilePath()
+  let profilePath = canonicalPluginPath(
+    configuredHiddenChatProfilePath()
+      ?? state.backgroundProfilePath
+      ?? hiddenChatProfilePath()
+  )
   var targets = CDPClient.fetchTargets(portOverride: port)
   let allowTestWebTarget = ProcessInfo.processInfo.environment["CHATGPT_AUTO_CONFIRM_ALLOW_TEST_WEB_TARGET"] == "1"
+  if port == CDPClient.port() && !allowTestWebTarget {
+    state.lastError = "background_port_matches_primary"
+    return [
+      "ok": false,
+      "errorCode": "background_port_matches_primary",
+      "message": "插件专用 ChatGPT 实例不能与用户主 ChatGPT 共用 CDP 端口。",
+      "backgroundOnly": false,
+      "runtimeState": "primary-rejected",
+      "workerUsed": false,
+      "port": port,
+    ]
+  }
   let assignedTargetId = state.backgroundChatTargetId
   func eligibleTarget(_ target: [String: Any]) -> Bool {
+    guard let targetId = target["id"] as? String else { return false }
+    if targetId == assignedTargetId {
+      guard allowTestWebTarget && port == CDPClient.port()
+        || pluginOwnedProfilePath(profilePath) else { return false }
+    } else if port == CDPClient.port() && !allowTestWebTarget {
+      return false
+    }
     if target["type"] as? String == "page"
         && (target["url"] as? String ?? "").hasPrefix("app://-/index.html")
         && !(target["url"] as? String ?? "").contains("/avatar-overlay") {
       return true
     }
-    if target["id"] as? String == assignedTargetId && isChatGptRendererTarget(target) {
+    if targetId == assignedTargetId && isChatGptRendererTarget(target) {
       return true
     }
     return allowTestWebTarget && isChatGptRendererTarget(target)
@@ -2405,7 +2666,8 @@ func ensureHiddenChatTarget(
         "ok": false,
         "errorCode": "background_chat_launch_failed",
         "message": error.localizedDescription,
-        "backgroundOnly": true,
+        "backgroundOnly": false,
+        "runtimeState": "unavailable",
         "workerUsed": false,
       ]
     }
@@ -2423,11 +2685,25 @@ func ensureHiddenChatTarget(
     return [
       "ok": false,
       "errorCode": "background_chat_target_unavailable",
-      "message": "隐藏 ChatGPT Chat 实例未能就绪；未使用当前 Work/worker 页面作为回退。",
-      "backgroundOnly": true,
+      "message": "插件自有 ChatGPT Chat 实例未能就绪；未使用当前 Work/worker 页面作为回退。",
+      "backgroundOnly": false,
       "workerUsed": false,
       "port": port,
     ]
+  }
+  if !allowTestWebTarget {
+    guard let activeProfile = pluginProfilePathForPort(port),
+          canonicalPluginPath(activeProfile) == canonicalPluginPath(profilePath) else {
+      state.lastError = "background_chat_profile_not_plugin_owned"
+      return [
+        "ok": false,
+        "errorCode": "background_chat_profile_not_plugin_owned",
+        "message": "调试端口上的 ChatGPT 实例不是插件创建的专用 profile；已拒绝接管。",
+        "backgroundOnly": false,
+        "workerUsed": false,
+        "port": port,
+      ]
+    }
   }
 
   func rebindAfterRendererReplacement() {
@@ -2492,8 +2768,8 @@ func ensureHiddenChatTarget(
       return selected ?? [
         "ok": false,
         "errorCode": "conversation_sidebar_selection_failed",
-        "message": "隐藏 Chat 无法从侧栏恢复指定会话。",
-        "backgroundOnly": true,
+        "message": "插件 Chat 无法从侧栏恢复指定会话。",
+        "backgroundOnly": false,
         "workerUsed": false,
       ]
     }
@@ -2567,50 +2843,41 @@ func ensureHiddenChatTarget(
     return prepared ?? [
       "ok": false,
       "errorCode": "background_chat_not_ready",
-      "message": "隐藏实例没有进入 Chat 页面；未向当前 Work/worker 页面发送。",
-      "backgroundOnly": true,
+      "message": "插件自有 ChatGPT 实例没有进入 Chat 页面；未向当前 Work/worker 页面发送。",
+      "backgroundOnly": false,
       "workerUsed": false,
       "port": port,
     ]
   }
 
-  // Switching the dedicated Electron instance from Codex to Chat can make its
-  // BrowserWindow visible again even when it was launched with `open -j`.
-  // Re-hide the process identified by this private debugging port, then wait
-  // for the renderer itself to report document.visibilityState == "hidden".
-  // This runs only after the Chat surface is confirmed and never targets the
-  // user's primary ChatGPT process.
-  if !runningOnGitHubActions(),
-     !allowTestWebTarget,
-     queueTargetRuntimeState(
-       port: port,
-       targetId: targetId,
-       refreshLifecycle: false
-     ) == .visible {
-    _ = hideDedicatedProcessForPort(port)
-    for _ in 0..<40 {
-      if queueTargetRuntimeState(
-        port: port,
-        targetId: targetId,
-        refreshLifecycle: false
-      ) == .hidden { break }
-      Thread.sleep(forTimeInterval: 0.05)
-    }
-  }
-
-  if !runningOnGitHubActions(),
-     !allowTestWebTarget,
-     queueTargetRuntimeState(
-       port: port,
-       targetId: targetId,
-       refreshLifecycle: false
-     ) != .hidden {
+  // Visibility is deliberately not a startup gate. A visible renderer is valid
+  // when it is the exact plugin-owned Chat surface; deployments that need the
+  // old policy can opt in through CHATGPT_AUTO_CONFIRM_REQUIRE_HIDDEN or
+  // CHATGPT_AUTO_CONFIRM_HEADLESS=0.
+  let runtimeState = queueTargetRuntimeState(
+    port: port,
+    targetId: targetId,
+    refreshLifecycle: false
+  )
+  if runtimeState == .visible && !queueAllowsVisibleDedicatedRenderer() {
     state.lastError = "background_chat_visibility_not_hidden"
     return [
       "ok": false,
       "errorCode": "background_chat_visibility_not_hidden",
-      "message": "专用 ChatGPT 页面未保持隐藏；已拒绝启动，避免影响当前可见页面。",
-      "backgroundOnly": true,
+      "message": "当前部署要求隐藏 ChatGPT 页面，但专用页面是可见的。",
+      "backgroundOnly": false,
+      "runtimeState": queueTargetRuntimeStateName(runtimeState),
+      "workerUsed": false,
+    ]
+  }
+  guard runtimeState == .hidden || runtimeState == .visible else {
+    state.lastError = "background_chat_runtime_unusable"
+    return [
+      "ok": false,
+      "errorCode": "background_chat_runtime_unusable",
+      "message": "插件自有 ChatGPT 页面未处于可用的 Chat renderer 状态。",
+      "backgroundOnly": false,
+      "runtimeState": queueTargetRuntimeStateName(runtimeState),
       "workerUsed": false,
     ]
   }
@@ -2623,6 +2890,8 @@ func ensureHiddenChatTarget(
   prepared["port"] = port
   prepared["targetId"] = targetId
   prepared["profilePath"] = profilePath
+  prepared["backgroundOnly"] = runtimeState == .hidden
+  prepared["runtimeState"] = queueTargetRuntimeStateName(runtimeState)
   return prepared
 }
 
@@ -3181,7 +3450,9 @@ func scanIPC(_ state: inout PluginState) -> [String: Any]? {
     return [
       "ok": true, "candidates": totalCandidates, "approved": totalApproved,
       "pending": totalPending, "blocked": totalBlocked, "unmatched": totalUnmatched,
-      "backgroundOnly": true, "pageChanged": false, "ipcPrimaryPath": true,
+      "backgroundOnly": pluginBackgroundRuntimeState(state) == .hidden,
+      "runtimeState": pluginBackgroundRuntimeState(state).map(queueTargetRuntimeStateName) as Any,
+      "pageChanged": false, "ipcPrimaryPath": true,
       "hiddenTargetCount": scannedTargetCount,
       "loadedRendererCount": scannedTargetCount, "scannedPorts": scannedPorts,
       "internalActions": totalInternalActions, "domEvents": totalDOMEvents
@@ -3191,7 +3462,9 @@ func scanIPC(_ state: inout PluginState) -> [String: Any]? {
     state.lastError = nil
     return [
       "ok": true, "candidates": 0, "approved": 0, "pending": 0,
-      "blocked": 0, "unmatched": 0, "backgroundOnly": true,
+      "blocked": 0, "unmatched": 0,
+      "backgroundOnly": pluginBackgroundRuntimeState(state) == .hidden,
+      "runtimeState": pluginBackgroundRuntimeState(state).map(queueTargetRuntimeStateName) as Any,
       "pageChanged": false, "ipcPrimaryPath": true,
       "hiddenTargetCount": scannedTargetCount,
       "loadedRendererCount": scannedTargetCount, "scannedPorts": scannedPorts,

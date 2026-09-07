@@ -538,68 +538,63 @@ func restartAutomationTaskForUpdatedGoal(_ task: inout AutomationTask) {
 }
 
 func automationTaskMessage(_ task: AutomationTask, forceFullGoal: Bool = false) -> String {
-  var goal = task.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+  // Queue snapshots can outlive a plugin upgrade. Strip every historical
+  // report contract before adding the current Work-only context, so a retry
+  // can never accidentally teach a Work Chat to emit the planner protocol.
+  var goal = messageWithoutTaskReportContract(
+    task.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+  )
   if let directive = task.pendingDirective?.trimmingCharacters(in: .whitespacesAndNewlines),
      !directive.isEmpty, !goal.contains(directive) {
     goal += "\n\n\(directive)"
   }
-  return goal
+  if let reviewFeedback = task.reviewFeedback?.trimmingCharacters(in: .whitespacesAndNewlines),
+     !reviewFeedback.isEmpty {
+    goal += "\n\n插件编排上下文（请直接执行，不要输出规划/验收 Chat 的固定回执或下一步模板）：\n\(reviewFeedback)"
+  }
+  // `forceFullGoal` is retained for persisted queue compatibility. Every Work
+  // Chat now receives the executable goal and any planner handoff, but never a
+  // completion-report contract.
+  _ = forceFullGoal
+  return messageWithoutTaskReportContract(goal)
 }
 
-func automationReviewMessage(
-  _ task: AutomationTask,
-  report: AutomationTaskReport
-) -> String {
-  return automationTaskMessage(task, forceFullGoal: true)
-}
-
-func startAutomationReview(
+func startAutomationPlanner(
   _ task: inout AutomationTask,
-  report: AutomationTaskReport,
+  workResult: String,
   port: Int,
   targetId: String,
   state: PluginState
 ) -> Bool {
-  guard let parentConversationId = normalizedConversationId(task.conversationId) else {
-    queueTrace("task=\(task.id) stage=review-branch failed reason=missing_parent_conversation")
+  _ = state
+  let trimmedWorkResult = messageWithoutTaskReportContract(workResult)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !trimmedWorkResult.isEmpty else {
+    queueTrace("task=\(task.id) stage=planner-branch failed reason=missing_work_result")
     return false
   }
-  let restoration = restoreHiddenConversation(
+
+  // The planner is intentionally a separate conversation. It receives the
+  // completed Work Chat's natural result and is the only role that receives
+  // the machine-readable report contract.
+  guard let prepared = prepareNewChatTarget(
     port: port,
     targetId: targetId,
-    conversationId: parentConversationId,
-    allowVisible: queueTargetStateIsUsableForQueue(
-      .visible,
-      workerMode: state.queueWorkerMode
-    )
-  )
-  guard restoration["ok"] as? Bool == true else {
-    queueTrace(
-      "task=\(task.id) stage=review-branch failed "
-        + "reason=parent_restore_failed error=\(restoration["error"] as? String ?? "unknown")"
-    )
-    return false
-  }
-  guard let prepared = cdpValue(
-    port: port,
-    targetId: targetId,
-    expression: continueInNewTaskJS(expectedConversationId: parentConversationId),
-    timeout: 35.0
+    timeout: 35.0,
+    allowBlankConversationReuse: false
   ), prepared["ok"] as? Bool == true else {
-    queueTrace("task=\(task.id) stage=review-branch failed reason=branch_not_confirmed")
+    queueTrace("task=\(task.id) stage=planner-branch failed reason=new_chat_not_confirmed")
     return false
   }
-  queueTrace(
-    "task=\(task.id) stage=review-branch complete "
-      + "parentConversation=\(parentConversationId) "
-      + "conversation=\(prepared["conversationId"] as? String ?? "none")"
-  )
-  let outbound = messageWithTaskReportContract(
-    automationReviewMessage(task, report: report),
+  let nextReviewRound = task.reviewRound + 1
+  let dispatchMarker = "规划验收 Chat 标识：\(task.id)-\(task.attempts)-\(nextReviewRound)"
+  let outbound = acceptancePlannerMessage(
+    originalGoal: task.originalPrompt ?? task.prompt,
+    workResult: trimmedWorkResult,
     taskId: task.id,
     appliedRevision: task.currentRevision,
     appliedDigest: task.specDigest
-  )
+  ) + "\n\n插件调度标记：\(dispatchMarker)"
   guard let sendResult = cdpValue(
     port: port,
     targetId: targetId,
@@ -609,8 +604,9 @@ func startAutomationReview(
       newChat: false,
       expectedConversationId: normalizedConversationId(prepared["conversationId"] as? String)
     ),
-    timeout: 35.0
+    timeout: 65.0
   ), sendResult["ok"] as? Bool == true else {
+    queueTrace("task=\(task.id) stage=planner-branch failed reason=send_not_confirmed")
     return false
   }
   _ = cdpValue(
@@ -619,7 +615,6 @@ func startAutomationReview(
     expression: autoConfirmChatContinuationJS(),
     timeout: 4.0
   )
-  let dispatchMarker = "验收 Chat 标识：\(task.id)-\(task.attempts)-\(task.reviewRound)"
   let resolvedConversation = cdpValue(
     port: port,
     targetId: targetId,
@@ -632,14 +627,51 @@ func startAutomationReview(
   let resolvedConversationId = normalizedConversationId(
     resolvedConversation?["conversationId"] as? String
   )
+  task.reviewRound = nextReviewRound
   task.reviewConversationId = resolvedConversationId
     ?? normalizedConversationId(prepared["conversationId"] as? String)
   task.reviewStatus = "running"
+  task.reviewReport = nil
+  task.lastResultJSON = jsonString([
+    "plannerInput": trimmedWorkResult,
+    "plannerConversationId": task.reviewConversationId as Any,
+    "dispatchMarker": dispatchMarker,
+    "sendResult": sendResult,
+  ])
   task.lastError = nil
   task.lastActivitySignature = nil
   task.lastProgressAt = isoFormatter.string(from: Date())
   task.updatedAt = task.lastProgressAt ?? isoFormatter.string(from: Date())
+  queueTrace(
+    "task=\(task.id) stage=planner-branch complete "
+      + "conversation=\(task.reviewConversationId ?? "none")"
+  )
   return true
+}
+
+// Kept as a compatibility shim for queue snapshots created by older runtimes.
+// New Work completion always goes through startAutomationPlanner with the
+// natural Work reply; it never sends a report contract to the Work Chat.
+func startAutomationReview(
+  _ task: inout AutomationTask,
+  report: AutomationTaskReport,
+  port: Int,
+  targetId: String,
+  state: PluginState
+) -> Bool {
+  let legacyResult = [
+    "摘要：\(report.summary)",
+    "已完成：\(report.completed.joined(separator: "；"))",
+    "剩余：\(report.remaining.joined(separator: "；"))",
+    "卡点：\(report.blockers.joined(separator: "；"))",
+  ].joined(separator: "\n")
+  return startAutomationPlanner(
+    &task,
+    workResult: legacyResult,
+    port: port,
+    targetId: targetId,
+    state: state
+  )
 }
 
 func dependencyCycle(in tasks: [AutomationTask]) -> [String]? {
@@ -682,7 +714,7 @@ func decodeLastJSONLine(at path: String?) -> (String, [String: Any])? {
   guard let path,
         let data = FileManager.default.contents(atPath: path),
         let text = String(data: data, encoding: .utf8) else { return nil }
-  for line in text.split(whereSeparator: \Character.isNewline).reversed() {
+  for line in text.split(whereSeparator: \.isNewline).reversed() {
     let raw = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
     guard let lineData = raw.data(using: .utf8),
           let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
@@ -917,9 +949,9 @@ func startQueueWatcher(_ state: inout PluginState) throws {
   environment["CHATGPT_AUTO_CONFIRM_STATE"] = queueStateURL().path
   environment["CHATGPT_AUTO_CONFIRM_QUEUE_STATE"] = queueStateURL().path
   // A local queue watcher is allowed to reuse its controller only when the
-  // general confirmer has already proved that exact renderer is hidden. This
-  // carries the safety decision into the detached watcher automatically, so
-  // local queue retries do not depend on callers remembering a HEADLESS env.
+  // general confirmer has already proved that exact renderer is plugin-owned
+  // and is a real Chat surface. Visibility is telemetry, not the ownership
+  // decision, so local retries do not depend on a hidden-only environment flag.
   let approvalState = generalApprovalStateForQueue()
   let backgroundPort = state.backgroundAppPort ?? approvalState?.backgroundAppPort
   let backgroundTargetId = state.backgroundChatTargetId

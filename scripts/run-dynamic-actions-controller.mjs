@@ -112,18 +112,11 @@ const fetchControl = () => {
   return control;
 };
 
-const reportContract = task => {
-  const taskId = JSON.stringify(runtimeId(task));
-  const revision = taskRevision(task);
-  const digest = JSON.stringify(task._specDigest || '');
-  return `
-MAHAYANA_TASK_REPORT_CONTRACT_V5
-下面是唯一允许的完成证书。只有整个仓库项目、全部验收、测试、发布和证据都完成时才输出；未完成、等待、阻塞或本轮提前结束时不要输出任何报告或“下一步”模板，小程序会把同一目标发送到新的 Chat：
-MAHAYANA_TASK_REPORT_V1_BEGIN
-{"protocol":"mahayana.task-report.v1","task_id":${taskId},"applied_task_revision":${revision},"applied_spec_digest":${digest},"status":"complete","all_tasks_complete":true,"summary":"整个项目已完成","completed":["已完成的项目、发布和验收证据"],"remaining":[],"blockers":[],"verification":["可复核的完整验收证据"],"wait_seconds":0,"wait_reason":"","next_connector":"","next_task":""}
-MAHAYANA_TASK_REPORT_V1_END
+const workDispatchBoundary = `
+本轮是工作 Chat：请直接执行以上目标，并在回复中给出自然语言工作结果。
+不要输出规划/验收 Chat 的固定回执、完成回执、未完成回执或下一步模板。
+插件会把本轮自然结果交给新的规划/验收 Chat；只有规划/验收 Chat 才负责固定回执，并由插件把其中的 next_task 原文交给下一轮新的工作 Chat。
 `;
-};
 
 const normalizedDirectory = value => String(value || '')
   .trim()
@@ -177,7 +170,7 @@ const taskPrompt = (control, task) => [
   `除非正在等待已启动的外部作业或确有人工卡点，本轮必须产生可核验的代码变更并运行相应测试；只阅读、检查、规划、发邮件或汇报结果都不算工作，不得因此结束。`,
   task.prompt,
   taskDocumentBlock(task),
-  reportContract(task),
+  workDispatchBoundary,
 ].filter(Boolean).join('\n\n');
 
 let activeControl = null;
@@ -240,7 +233,7 @@ const reconcileControl = control => {
       // The per-session controller owns recovery budgets for an unchanged
       // runtime id. Requeueing failed/blocked tasks here on every five-second
       // boundary bypassed maxRuntimeRetries and ACTION_MAX_SAME_FAILURE_RECOVERIES,
-      // so one broken hidden renderer could be resurrected indefinitely while
+      // so one broken plugin renderer could be resurrected indefinitely while
       // the outer Actions job remained in_progress. A changed revision/digest
       // gets a new runtime id and is still enqueued below; an unchanged
       // terminal task is left for the child controller to retry finitely or

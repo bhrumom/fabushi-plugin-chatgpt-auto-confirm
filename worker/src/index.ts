@@ -6,6 +6,7 @@ const EMAIL_WORKFLOW_SUFFIX = '';
 const DEFAULT_CHAT_TIMEOUT_SECONDS = 21_600;
 const MAX_CHAT_TIMEOUT_SECONDS = 86_400;
 const CHAT_STAGNATION_TIMEOUT_SECONDS = 10_800;
+const CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS = 300;
 const PLUGIN_DISPATCH_BROWSER = 'iab';
 const PLUGIN_DISPATCH_CAPABILITY = 'browser.in-app.dispatch-and-watch';
 const PLUGIN_DISPATCH_MODEL = 'GPT-5.6 Sol';
@@ -24,10 +25,11 @@ const pluginDispatchParams = (goal: string) => ({
   surface: 'chat',
   newChat: true,
   resumeExisting: false,
-  goalOnlyDispatch: true,
+  goalOnlyDispatch: false,
   approveAll: true,
   timeout: DEFAULT_CHAT_TIMEOUT_SECONDS,
   stagnationTimeout: CHAT_STAGNATION_TIMEOUT_SECONDS,
+  noFinalReplyTimeout: CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS,
   maxRecoveryAttempts: 5,
   autoContinueIncomplete: true,
   maxTaskContinuations: 0,
@@ -90,6 +92,19 @@ const queuedTaskSchema = {
   },
 };
 const tools = [
+  { name: 'browser_reply_handoff', description: '注册网页回复结束后唤醒本地 Luna 中等推理任务；只有独立持久宿主和去重通知接口实际就绪才接受注册。注册成功后可结束本地回合，不轮询。', annotations: annotations(), inputSchema: {
+    type: 'object', additionalProperties: false, required: ['action', 'watchId'], properties: {
+      action: { type: 'string', enum: ['register', 'status', 'cancel'] },
+      watchId: { type: 'string', pattern: '^[a-zA-Z0-9_-]{1,128}$' },
+      tabId: { type: 'string' }, threadId: { type: 'string', description: '本地 Work 会话 ID；在当前 Work 回合中可省略，插件会绑定当前 CODEX_THREAD_ID' },
+      conversationUrl: { type: 'string' },
+      expectedUserDigest: { type: 'string', description: '本轮已发送用户消息的 SHA-256，避免把旧回复当作新回复' },
+      baselineAssistantDigest: { type: 'string', description: '发送前最后一条 assistant 消息的 SHA-256；不存在时为空字符串的 SHA-256' },
+    },
+  } },
+  { name: 'work_bridge_status', description: '读取本机 Work 唤醒桥的受支持传输、模型和启用状态；不会启动模型回合或返回会话内容', annotations: annotations(true), inputSchema: {
+    type: 'object', additionalProperties: false, properties: {},
+  } },
   { name: 'account_list', description: '列出本机已注册的 ChatGPT 账号（不返回凭证、邮箱或 Cookie）', annotations: annotations(true), inputSchema: {
     type: 'object', additionalProperties: false, properties: {},
   } },
@@ -189,7 +204,7 @@ const tools = [
   { name: 'diagnose', description: '只读检查 ChatGPT 已加载的辅助功能结构', annotations: annotations(true), inputSchema: {
     type: 'object', additionalProperties: false, properties: {},
   } },
-  { name: 'dispatch_goal', description: '由插件通过受授权的内置 Browser 派发一个一次性完整目标：每个目标都有独立后台标签页；最多两个目标可同时持续推进。只发送 goal，固定选择聊天页、GPT-5.6 Sol 和极高，自动批准授权卡（优先会话范围，不可用时直接允许）；只有完整完成回执和验证证据才停止，未完成或回执缺失时自动续作', annotations: annotations(), inputSchema: {
+  { name: 'dispatch_goal', description: '由插件总控通过受授权的内置 Browser 持续推进一个完整目标：每个目标都有独立标签页，最多两个目标可同时推进。第一轮发送给工作 Chat 的只有 goal；工作 Chat 返回自然结果后，插件新开规划/验收 Chat，只有规划 Chat 输出 MAHAYANA_TASK_REPORT_V1，并把 next_task 原文交给下一轮新的工作 Chat。工作 Chat 若已结束却没有最终回复，插件在有界等待后关闭旧 Chat 并用新 Work Chat 重发原指令，不把空结果交给规划 Chat。插件固定使用聊天页、GPT-5.6 Sol 和 Extra High，自动批准授权卡；标签页可见或隐藏，重试前关闭精确的插件实例/标签页', annotations: annotations(), inputSchema: {
     type: 'object', additionalProperties: false, required: ['goal'], properties: {
       goal: { type: 'string', minLength: 1, maxLength: 10000, description: '只填写原始目标；不要传入历史进度、上一轮回复或续作文本' },
     },
@@ -210,20 +225,27 @@ const tools = [
       jobId: { type: 'string', pattern: '^iab_[A-Za-z0-9-]{20,100}$' },
     },
   } },
-  { name: 'send_and_watch', description: '在指定 Chat 页面发送目标并等待回复；长期目标优先使用 dispatch_goal 的内置 Browser capability', annotations: annotations(), inputSchema: {
+  { name: 'send_and_watch', description: '由插件总控在一个插件自有的 ChatGPT.app 实例中创建新 Chat、发送目标并等待最终回复；若会话结束但没有最终回复，插件关闭旧 Chat 并在新 Work Chat 重发同一指令；工作 Chat 返回自然结果后，插件自动新开规划/验收 Chat，读取其安排，再把 next_task 交给下一轮工作 Chat', annotations: annotations(), inputSchema: {
     type: 'object', additionalProperties: false, properties: {
-      message: { type: 'string', minLength: 1, maxLength: 10000, description: '只填写原始目标；插件会追加固定的完成回执模板' },
+      message: { type: 'string', minLength: 1, maxLength: 10000, description: '填写本轮要执行的自然语言目标或规划 Chat 要求；工作 Chat 不会收到完成回执模板' },
+      role: { type: 'string', enum: ['work', 'planner'], default: 'work', description: 'work=直接执行并返回自然结果；planner=读取工作结果、验收并按模板输出下一步安排' },
+      autoPlanAfterWork: { type: 'boolean', default: true, description: '工作 Chat 完成后是否自动新开规划/验收 Chat；规划 Chat 内部调用会自动关闭此开关' },
+      originalGoal: { type: 'string', maxLength: 10000, description: '整个任务的原始总目标；插件转发给规划 Chat 用于判断是否真正完成' },
+      taskId: { type: 'string', maxLength: 128, description: '可选的插件任务标识，用于绑定工作 Chat、规划 Chat 和下一轮安排' },
+      appliedRevision: { type: 'integer', minimum: 1, description: '可选的项目任务修订号，规划 Chat 验收时必须核对' },
+      appliedDigest: { type: 'string', maxLength: 256, description: '可选的项目规范摘要哈希，规划 Chat 验收时必须核对' },
       connector: { type: 'string', description: '要从 ChatGPT Apps 菜单选择的 MCP connector 名称（如 devspace1）' },
       conversationId: { type: 'string', pattern: '^[A-Za-z0-9-]{8,128}$', description: '只读恢复监视时要绑定的 Chat 会话 ID；任何实际发送都会忽略旧会话并新建 Chat' },
-      chatUrl: { type: 'string', pattern: '^https://chatgpt\\.com/(?:$|c/)', description: '精确操作的 ChatGPT 对话地址；界面隐藏后仍会在后台挂载' },
-      newChat: { type: 'boolean', default: true, description: '在隐藏 ChatGPT.app 实例中点击「新聊天」并选中 Chat，再选择 connector 并发送' },
+      chatUrl: { type: 'string', pattern: '^https://chatgpt\\.com/(?:$|c/)', description: '精确操作的 ChatGPT 对话地址；仅允许插件自有实例中的 Chat 表面' },
+      newChat: { type: 'boolean', default: true, description: '在插件自有 ChatGPT.app 实例中点击「新聊天」并选中 Chat，再选择 connector 并发送；实例可见或隐藏' },
       timeout: { type: 'integer', minimum: 10, maximum: MAX_CHAT_TIMEOUT_SECONDS, default: DEFAULT_CHAT_TIMEOUT_SECONDS, description: '等待最终回复的最大秒数；必须长于 3 小时无进展阈值' },
-      accountId: { type: 'string', pattern: '^acct_[0-9a-f]{12}$', description: '固定此隐藏 Chat 使用的账号' },
-      stagnationTimeout: { type: 'integer', minimum: 60, maximum: CHAT_STAGNATION_TIMEOUT_SECONDS, default: CHAT_STAGNATION_TIMEOUT_SECONDS, description: '页面连续无新内容多少秒后直接开启新 Chat；旧 Chat 保持运行，默认 3 小时' },
-      maxRecoveryAttempts: { type: 'integer', minimum: 0, maximum: 5, default: 5, description: '页面无进展后在新 Chat 自动发送续作指令的最大次数；超过后截图并报错' },
+      accountId: { type: 'string', pattern: '^acct_[0-9a-f]{12}$', description: '固定此插件自有 Chat 使用的账号' },
+      stagnationTimeout: { type: 'integer', minimum: 60, maximum: CHAT_STAGNATION_TIMEOUT_SECONDS, default: CHAT_STAGNATION_TIMEOUT_SECONDS, description: '页面连续无新内容多少秒后关闭旧插件 Chat 并创建新 Chat；默认 3 小时' },
+      noFinalReplyTimeout: { type: 'integer', minimum: 30, maximum: CHAT_STAGNATION_TIMEOUT_SECONDS, default: CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS, description: '用户消息已发送但会话结束且没有最终回复时，等待多少秒后关闭旧插件 Chat 并用新的 Work Chat 重发原指令；默认 5 分钟' },
+      maxRecoveryAttempts: { type: 'integer', minimum: 0, maximum: 5, default: 5, description: '页面无进展后关闭旧插件 Chat、创建新 Chat 并自动续作的最大次数；超过后截图并报错' },
       autoContinueIncomplete: { type: 'boolean', default: true, description: '回复明确未完成、阻塞、模糊或提前结束时，自动在全新 Chat 续作同一目标' },
       maxTaskContinuations: { type: 'integer', minimum: 0, maximum: 20, default: 0, description: '0 表示持续续作直到完成；正数表示显式上限' },
-      continuationMessage: { type: 'string', maxLength: 4000, description: '兼容旧调用但不会使用；续作只发送原始目标和固定完成回执模板' },
+      continuationMessage: { type: 'string', maxLength: 4000, description: '兼容旧调用但不会使用；续作由规划 Chat 的 next_task 或原始目标决定，工作 Chat 不接收报告模板' },
       resumeExisting: { type: 'boolean', default: false, description: '仅继续监视已发送的当前 Chat，不重复发送指令' },
       approveAll: { type: 'boolean', description: '自动确认所有授权卡片（默认 true）' },
       pollIntervalMs: { type: 'integer', minimum: 200, maximum: 5000, default: 500, description: '轮询回复的间隔毫秒数' },
@@ -373,6 +395,12 @@ export default {
         rpc.id, 'desktop.chatgpt-approvals.audit', { limit: args.limit ?? 20 }, 'none');
       if (name === 'diagnose') return hostResult(
         rpc.id, 'desktop.chatgpt-approvals.diagnose', {}, 'none');
+      if (name === 'browser_reply_handoff') return reply(rpc.id, {
+        isError: true, content: [{ type: 'text', text: '此功能需要本地插件和独立 Work 通知宿主，云端不能模拟注册成功。' }],
+        structuredContent: { ok: false, errorCode: 'local_work_bridge_required' },
+      });
+      if (name === 'work_bridge_status') return hostResult(
+        rpc.id, 'desktop.chatgpt-work-bridge.status', {}, 'none');
       if (name === 'dispatch_goal') {
         const goal = String(args.goal ?? '').trim();
         if (!goal || goal.length > 10000) {
@@ -398,9 +426,20 @@ export default {
         if (!msg || msg.length > 10000) {
           return error(rpc.id, -32602, 'message 必须是 1-10000 字符的非空文本');
         }
+        const role = args.role === 'planner' ? 'planner' : 'work';
         const resumeExisting = args.resumeExisting === true;
+        const numericRevision = args.appliedRevision == null ? null : Number(args.appliedRevision);
+        if (numericRevision != null && (!Number.isInteger(numericRevision) || numericRevision < 1)) {
+          return error(rpc.id, -32602, 'appliedRevision 必须是大于等于 1 的整数');
+        }
         return hostResult(rpc.id, 'desktop.chatgpt-approvals.send-and-watch', {
           message: msg,
+          role,
+          autoPlanAfterWork: role === 'work' && args.autoPlanAfterWork !== false,
+          originalGoal: String(args.originalGoal ?? msg).trim().slice(0, 10000),
+          taskId: args.taskId == null ? null : String(args.taskId).trim().slice(0, 128),
+          appliedRevision: numericRevision,
+          appliedDigest: args.appliedDigest == null ? null : String(args.appliedDigest).trim().slice(0, 256),
           accountId: args.accountId || null,
           connector: args.connector || null,
           conversationId: resumeExisting ? (args.conversationId || null) : null,
@@ -408,11 +447,11 @@ export default {
           newChat: !resumeExisting,
           timeout: Math.min(MAX_CHAT_TIMEOUT_SECONDS, Math.max(10, args.timeout ?? DEFAULT_CHAT_TIMEOUT_SECONDS)),
           stagnationTimeout: Math.min(CHAT_STAGNATION_TIMEOUT_SECONDS, Math.max(60, args.stagnationTimeout ?? CHAT_STAGNATION_TIMEOUT_SECONDS)),
+          noFinalReplyTimeout: Math.min(CHAT_STAGNATION_TIMEOUT_SECONDS, Math.max(30, args.noFinalReplyTimeout ?? CHAT_NO_FINAL_REPLY_TIMEOUT_SECONDS)),
           maxRecoveryAttempts: Math.min(5, Math.max(0, args.maxRecoveryAttempts ?? 5)),
           autoContinueIncomplete: args.autoContinueIncomplete !== false,
           maxTaskContinuations: Math.min(20, Math.max(0, args.maxTaskContinuations ?? 0)),
-          originalGoal: msg,
-          goalOnlyDispatch: true,
+          goalOnlyDispatch: false,
           continuationMessage: null,
           resumeExisting,
           approveAll: args.approveAll !== false,

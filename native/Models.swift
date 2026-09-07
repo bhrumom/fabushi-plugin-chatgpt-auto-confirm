@@ -46,9 +46,10 @@ struct PluginState: Codable {
   var queueReviewGate: Bool?
   var queueWatcherPid: Int32?
   var queueRuntimeRevision: String?
-  // Every running task owns a hidden ChatGPT process cloned from the restored
-  // authenticated profile. It never navigates the primary window where the
-  // user types, and tasks cannot close one another's renderer.
+  // Every running task owns a plugin-created ChatGPT process/target cloned
+  // from the restored authenticated profile. Its window may be visible or
+  // hidden; it never navigates the primary window where the user types, and
+  // tasks cannot close one another's renderer.
   var queueWorkerPort: Int?
   var queueWorkerTargetId: String?
   var queueWorkerProfilePath: String?
@@ -191,9 +192,9 @@ struct AutomationTask: Codable {
   var lastProgressAt: String?
   var waitingUntil: String?
   var waitReason: String?
-  // Conversation is durable state; hidden renderer is only a recoverable worker.
-  // These fields allow the queue to recover after a renderer disappears instead
-  // of treating the task as failed.
+  // Conversation is durable state; the plugin-owned renderer is only a
+  // recoverable worker. These fields allow the queue to recover after a
+  // renderer disappears instead of treating the task as failed.
   var hiddenWorkerLastHeartbeatAt: String? = nil
   var hiddenWorkerRecoveryCount: Int? = nil
   var hiddenWorkerLastError: String? = nil

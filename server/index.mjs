@@ -6,7 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import worker from '../worker/src/index.ts';
-import { DEFAULT_BROWSER_HEARTBEAT_SLICE_MS } from '../scripts/in-app-browser-capability-host.mjs';
+import {
+  DEFAULT_BROWSER_HEARTBEAT_SLICE_MS,
+  parseTaskReport,
+} from '../scripts/in-app-browser-capability-host.mjs';
+import { localWorkBridgeDescriptor } from '../scripts/local-work-bridge.mjs';
 
 const defaultNativeRuntime = fileURLToPath(new URL(
   '../runtime/macos/chatgpt-auto-confirm', import.meta.url));
@@ -24,9 +28,11 @@ const browserCapabilityFile = process.env.CHATGPT_AUTO_CONFIRM_BROWSER_CAPABILIT
 const browserJobStateFile = process.env.CHATGPT_AUTO_CONFIRM_BROWSER_JOB_FILE
   || resolve(homedir(), '.codex', 'browser', 'chatgpt-auto-confirm-job.json');
 const browserSupervisors = new Map();
+let replyHandoffSupervisor = null;
 const desktopDirectJobs = new Map();
 const sleep = milliseconds => new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds));
 const browserTerminalStatuses = new Set(['completed', 'stopped', 'failed']);
+const replyHandoffTerminalStatuses = new Set(['delivered', 'cancelled', 'superseded']);
 const maxParallelBrowserJobs = 2;
 const configuredBrowserHostRetryDelayMs = Number(process.env.CHATGPT_AUTO_CONFIRM_BROWSER_RETRY_MS);
 const browserHostRetryDelayMs = Number.isFinite(configuredBrowserHostRetryDelayMs)
@@ -43,10 +49,13 @@ const pluginDispatchParams = (goal) => ({
   surface: 'chat',
   newChat: true,
   resumeExisting: false,
-  goalOnlyDispatch: true,
+  // Compatibility metadata only; continuations are always fresh Chat
+  // boundaries and are never direct goal-only sends.
+  goalOnlyDispatch: false,
   approveAll: true,
   timeout: 21_600,
   stagnationTimeout: 10_800,
+  noFinalReplyTimeout: 300,
   maxRecoveryAttempts: 5,
   autoContinueIncomplete: true,
   maxTaskContinuations: 0,
@@ -326,6 +335,74 @@ async function resumePersistedBrowserSupervisor() {
   for (const job of await readPersistedBrowserJobs()) startBrowserSupervisor(job.id);
 }
 
+function replyHandoffWatches(result) {
+  return Array.isArray(result?.replyHandoffWatches)
+    ? result.replyHandoffWatches.filter(Boolean) : [];
+}
+
+// Reply handoff observation is intentionally owned by the plugin server, not
+// by the model turn that registered it. The trusted Browser host exposes one
+// bounded `tick` endpoint; this loop keeps checking that endpoint after the
+// caller's turn has returned and stops as soon as every watch is terminal.
+function startReplyHandoffSupervisor() {
+  if (replyHandoffSupervisor) return;
+  const supervisor = (async () => {
+    let unavailableSince = 0;
+    while (true) {
+      const descriptor = await readBrowserCapability();
+      if (!descriptor.ok) {
+        unavailableSince ||= Date.now();
+        // Preserve watches across a short Browser lease rotation. If the
+        // descriptor never returns, bound this background loop so an orphaned
+        // capability cannot keep a process alive forever.
+        if (Date.now() - unavailableSince > 7 * 24 * 60 * 60 * 1000) break;
+        await sleep(browserHostRetryDelayMs);
+        continue;
+      }
+      unavailableSince = 0;
+      const health = await callBrowserCapability(
+        descriptor, '/v1/capability', 'GET', undefined, 5_000,
+      );
+      if (!health?.ok) {
+        await sleep(browserHostRetryDelayMs);
+        continue;
+      }
+      const watches = replyHandoffWatches(health);
+      if (watches.length === 0) break;
+      if (watches.every(watch => replyHandoffTerminalStatuses.has(watch.status))) break;
+      const result = await callBrowserCapability(
+        descriptor,
+        '/v1/reply-handoff',
+        'POST',
+        { action: 'tick', watchId: watches[0]?.watchId },
+        15_000,
+      );
+      if (!result?.ok) {
+        await sleep(browserHostRetryDelayMs);
+        continue;
+      }
+      const updated = Array.isArray(result.watches) ? result.watches : [];
+      if (updated.length > 0
+          && updated.every(watch => replyHandoffTerminalStatuses.has(watch.status))) break;
+      await sleep(1_000);
+    }
+  })().catch(() => {}).finally(() => {
+    replyHandoffSupervisor = null;
+  });
+  replyHandoffSupervisor = supervisor;
+}
+
+async function resumePersistedReplyHandoffSupervisor() {
+  const descriptor = await readBrowserCapability();
+  if (!descriptor.ok) return;
+  const health = await callBrowserCapability(
+    descriptor, '/v1/capability', 'GET', undefined, 5_000,
+  );
+  if (replyHandoffWatches(health).some(watch => !replyHandoffTerminalStatuses.has(watch.status))) {
+    startReplyHandoffSupervisor();
+  }
+}
+
 function resultBrowserJobs(result, fallback = []) {
   if (Array.isArray(result?.jobs)) return result.jobs.filter(Boolean);
   if (Array.isArray(result?.activeJobs)) return result.activeJobs.filter(Boolean);
@@ -344,8 +421,10 @@ function waitingForBrowserHost(jobs) {
 // and Apps menu can change labels between releases. Keep the direct desktop
 // path small and conservative: it only talks to the plugin-owned debugging
 // port, validates the Chat surface, uses native CDP pointer/input events, and
-// requires a matching user-message bubble before reporting success. This is
-// intentionally separate from the Browser capability path.
+// requires a matching user-message bubble before reporting success. It uses
+// the same Work -> fresh planner -> raw next_task -> fresh Work state machine
+// as the Browser/native paths, but keeps the desktop transport opt-in for
+// compatibility.
 function desktopCDPPort(argumentsObject = {}) {
   const configured = Number(
     argumentsObject.backgroundPort
@@ -741,7 +820,9 @@ function desktopApprovalExpression({ invokeClick = false } = {}) {
       cardHasModal: selected.container.getAttribute('aria-modal') === 'true',
       inViewport: rect.bottom > 0 && rect.right > 0
         && rect.left < window.innerWidth && rect.top < window.innerHeight,
-      clickedByDom: ${clickedValue}
+      clickedByDom: ${clickedValue},
+      visibility: document.visibilityState,
+      runtimeState: document.visibilityState === 'hidden' ? 'hidden' : 'visible'
     };
   })()`;
 }
@@ -755,10 +836,17 @@ async function directDesktopApprove(rpc) {
   const connector = String(args.connector || '').trim();
   const port = desktopCDPPort(args);
   let target = await desktopTarget(port, args.backgroundTargetId || null);
+  const runtimeMetadata = value => {
+    const visibility = String(value?.visibility || '').trim();
+    return {
+      backgroundOnly: visibility === 'hidden',
+      runtimeState: visibility === 'hidden' || visibility === 'visible' ? visibility : 'unavailable',
+    };
+  };
   if (!target) return {
     ok: false, errorCode: 'desktop_chat_target_unavailable',
     message: `插件专用桌面 ChatGPT 调试目标不可用（端口 ${port}）。`,
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(null), workerUsed: false, surface: 'chat', port,
   };
   const approval = await desktopEvaluate(target, desktopApprovalExpression());
   if (!approval) return {
@@ -766,7 +854,7 @@ async function directDesktopApprove(rpc) {
     message: connector
       ? `当前没有检测到结构化授权卡（调用方标记：${connector}）。`
       : '当前没有检测到结构化授权卡。',
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(approval || target), workerUsed: false, surface: 'chat', port,
     targetId: target.id,
   };
   if (approval.inViewport === false) {
@@ -793,7 +881,7 @@ async function directDesktopApprove(rpc) {
     message: remaining
       ? '插件点击了结构化授权卡的允许按钮，但未确认卡片消失。'
       : '插件已确认结构化授权卡完成。',
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(approval || target), workerUsed: false, surface: 'chat', port,
     targetId: target.id, approvedAt: !remaining ? new Date().toISOString() : undefined,
   };
 }
@@ -851,6 +939,8 @@ function desktopReplyStateExpression(messagePrefix = '') {
       conversationId: document.querySelector('[data-above-composer-conversation-id]')
         ?.getAttribute('data-above-composer-conversation-id') || null,
       url: window.location.href || '',
+      visibility: document.visibilityState,
+      runtimeState: document.visibilityState === 'hidden' ? 'hidden' : 'visible',
     };
   })()`;
 }
@@ -860,18 +950,39 @@ function desktopConversationId(value) {
   return raw.startsWith('chatgpt:') ? raw.slice('chatgpt:'.length) : raw || null;
 }
 
-function compactDesktopDispatchPrompt(args, fallbackMessage) {
-  let goal = String(args.originalGoal || fallbackMessage || '').trim();
-  for (const marker of ['MAHAYANA_TASK_REPORT_CONTRACT_V5', 'MAHAYANA_TASK_REPORT_V1_BEGIN']) {
-    const markerIndex = goal.indexOf(marker);
-    if (markerIndex >= 0) goal = goal.slice(0, markerIndex).trim();
+function stripDesktopTaskReportContract(value) {
+  let message = String(value || '').trim();
+  for (const marker of [
+    'MAHAYANA_TASK_REPORT_CONTRACT_V6',
+    'MAHAYANA_TASK_REPORT_CONTRACT_V5',
+    'MAHAYANA_TASK_REPORT_V1_BEGIN',
+  ]) {
+    const markerIndex = message.indexOf(marker);
+    if (markerIndex >= 0) message = message.slice(0, markerIndex).trim();
   }
+  return message;
+}
+
+function compactDesktopDispatchPrompt(args, fallbackMessage) {
+  const role = args.role === 'planner' ? 'planner' : 'work';
+  // A work Chat receives only the executable goal. The planner is the only
+  // role that receives the report contract and turns its natural review into
+  // the next raw work instruction.
+  const source = String(args.message || args.originalGoal || fallbackMessage || '').trim();
+  const goal = stripDesktopTaskReportContract(source);
+  if (role !== 'planner') {
+    return goal;
+  }
+  const workResult = stripDesktopTaskReportContract(
+    args.workResult || args.naturalWorkResult || '',
+  ).slice(0, 50_000);
   const taskId = JSON.stringify(String(args.taskId || 'CURRENT_TASK_ID').trim() || 'CURRENT_TASK_ID');
-  const revision = Number.isInteger(args.appliedTaskRevision)
-    ? args.appliedTaskRevision : 1;
-  const digest = JSON.stringify(String(args.appliedSpecDigest || 'CURRENT_SPEC_DIGEST').trim()
+  const revisionValue = args.appliedRevision ?? args.appliedTaskRevision;
+  const revision = Number.isInteger(revisionValue) ? revisionValue : 1;
+  const digestValue = args.appliedDigest ?? args.appliedSpecDigest;
+  const digest = JSON.stringify(String(digestValue || 'CURRENT_SPEC_DIGEST').trim()
     || 'CURRENT_SPEC_DIGEST');
-  return `${goal}\n\n完成整个目标后，在回复末尾只输出以下完成回执（未完成时不要伪造 complete）：\nMAHAYANA_TASK_REPORT_V1_BEGIN\n{"protocol":"mahayana.task-report.v1","task_id":${taskId},"applied_task_revision":${revision},"applied_spec_digest":${digest},"status":"complete","all_tasks_complete":true,"summary":"整个目标已完成","completed":["列出实现、验证和发布证据"],"remaining":[],"blockers":[],"verification":["列出可复核证据"],"wait_seconds":0,"wait_reason":"","next_connector":"","next_task":""}\nMAHAYANA_TASK_REPORT_V1_END`;
+  return `${goal}\n\n工作 Chat 自然结果 BEGIN\n${workResult || '本轮没有返回稳定的自然语言结果，请检查 checkout 后决定下一步。'}\n工作 Chat 自然结果 END\n\nMAHAYANA_TASK_REPORT_CONTRACT_V6\n你是规划/验收 Chat，不是工作 Chat。请根据工作 Chat 的自然结果和当前 checkout 的实际状态决定下一步安排。\n必须在回复末尾输出一次且仅一次 MAHAYANA_TASK_REPORT_V1。完成时使用 status=complete、all_tasks_complete=true、remaining=[]、blockers=[]、next_task=""；未完成或被阻塞时使用 status=incomplete 或 blocked、all_tasks_complete=false，并把下一轮工作 Chat 要执行的完整安排写入 next_task。不要把规划说明或模板要求转发给工作 Chat。\nMAHAYANA_TASK_REPORT_V1_BEGIN\n{"protocol":"mahayana.task-report.v1","task_id":${taskId},"applied_task_revision":${revision},"applied_spec_digest":${digest},"status":"complete","all_tasks_complete":true,"summary":"整个目标已完成","completed":["列出实现、验证和发布证据"],"remaining":[],"blockers":[],"verification":["列出可复核证据"],"wait_seconds":0,"wait_reason":"","next_connector":"","next_task":""}\nMAHAYANA_TASK_REPORT_V1_END`;
 }
 
 async function directDesktopSend(rpc) {
@@ -881,14 +992,22 @@ async function directDesktopSend(rpc) {
   const connector = String(args.connector || '').trim();
   if (!message) return {
     ok: false, errorCode: 'missing_message', message: '请提供 message 参数',
-    backgroundOnly: true, workerUsed: false, surface: 'chat',
+    backgroundOnly: false, runtimeState: 'unavailable', workerUsed: false, surface: 'chat',
   };
   const port = desktopCDPPort(args);
   let target = await desktopTarget(port, args.backgroundTargetId || null);
+  let surface = null;
+  const runtimeMetadata = value => {
+    const visibility = String(value?.visibility || '').trim();
+    return {
+      backgroundOnly: visibility === 'hidden',
+      runtimeState: visibility === 'hidden' || visibility === 'visible' ? visibility : 'unavailable',
+    };
+  };
   if (!target) return {
     ok: false, errorCode: 'desktop_chat_target_unavailable',
     message: `插件专用桌面 ChatGPT 调试目标不可用（端口 ${port}）。`,
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
   };
   const evaluate = async expression => {
     try {
@@ -915,12 +1034,12 @@ async function directDesktopSend(rpc) {
     }
     return null;
   };
-  let surface = await evaluate(desktopSurfaceExpression);
+  surface = await evaluate(desktopSurfaceExpression);
   if (!surface?.ok) {
     if (!await click(desktopChatButtonExpression)) return {
       ok: false, errorCode: 'desktop_chat_mode_button_not_found',
       message: '插件未找到桌面 ChatGPT 的 Chat 模式按钮，未发送。',
-      backgroundOnly: true, workerUsed: false, surface: 'not-chat', port,
+      ...runtimeMetadata(surface), workerUsed: false, surface: 'not-chat', port,
     };
     surface = await waitUntil(async () => {
       const current = await evaluate(desktopSurfaceExpression);
@@ -930,7 +1049,7 @@ async function directDesktopSend(rpc) {
   if (!surface?.ok) return {
     ok: false, errorCode: 'desktop_chat_surface_not_ready',
     message: '桌面 ChatGPT 未进入可发送的 Chat 表面，未发送。',
-    backgroundOnly: true, workerUsed: false, surface: 'not-chat', port,
+    ...runtimeMetadata(surface), workerUsed: false, surface: 'not-chat', port,
   };
 
   const previousConversationId = desktopConversationId(surface.conversationId);
@@ -943,7 +1062,7 @@ async function directDesktopSend(rpc) {
       if (!await click(desktopNewChatExpression)) return {
         ok: false, errorCode: 'desktop_new_chat_button_not_found',
         message: '插件未找到桌面 ChatGPT 的新对话按钮，未发送。',
-        backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+        ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
       };
       surface = await waitUntil(async () => {
         const current = await evaluate(desktopSurfaceExpression);
@@ -958,10 +1077,17 @@ async function directDesktopSend(rpc) {
       if (!surface?.ok) return {
         ok: false, errorCode: 'desktop_new_chat_not_confirmed',
         message: '插件点击了新对话，但未确认空白 Chat 已建立，未发送。',
-        backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+        ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
       };
     }
   }
+
+  const baselineCounts = await evaluate(`(() => ({
+    user: document.querySelectorAll('[data-message-author-role="user"], [data-user-message-bubble]').length,
+    assistant: document.querySelectorAll('[data-message-author-role="assistant"], [data-local-conversation-final-assistant]').length,
+  }))()`);
+  const beforeUserMessageCount = Number(baselineCounts?.user || 0);
+  const beforeAssistantCount = Number(baselineCounts?.assistant || 0);
 
   // A failed send can leave a draft in the ProseMirror composer even though
   // no user message was created. Clear the editable draft before rebuilding
@@ -977,7 +1103,7 @@ async function directDesktopSend(rpc) {
   if (!composerFocused) return {
     ok: false, errorCode: 'desktop_input_not_found',
     message: '插件未找到桌面 ChatGPT 输入框，未发送。',
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
   };
   const modifier = process.platform === 'darwin' ? 4 : 2;
   await desktopCDPCall(target, 'Input.dispatchKeyEvent', {
@@ -1016,13 +1142,13 @@ async function directDesktopSend(rpc) {
       })()`)) return {
         ok: false, errorCode: 'desktop_apps_button_not_found',
         message: '插件未找到桌面 ChatGPT 的 Apps 按钮，未发送。',
-        backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+        ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
       };
       const menuItem = await waitUntil(async () => evaluate(desktopConnectorMenuExpression(connector)), 5_000);
       if (!menuItem) return {
         ok: false, errorCode: 'desktop_connector_not_found',
         message: `桌面 ChatGPT Apps 菜单中没有找到连接器 ${connector}，未发送。`,
-        backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+        ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
       };
       if (menuItem.clicked !== true) await desktopPointerClick(target, menuItem.x, menuItem.y);
       connectorConfirmed = !!(await waitUntil(async () => {
@@ -1072,7 +1198,7 @@ async function directDesktopSend(rpc) {
     if (!connectorConfirmed) return {
       ok: false, errorCode: 'desktop_connector_not_confirmed',
       message: `插件未确认连接器 ${connector} 已绑定到当前 Chat，未发送。`,
-      backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+      ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
     };
   }
 
@@ -1086,7 +1212,7 @@ async function directDesktopSend(rpc) {
   if (!inputReady) return {
     ok: false, errorCode: 'desktop_input_not_found',
     message: '插件未找到桌面 ChatGPT 输入框，未发送。',
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
   };
   await desktopCDPCall(target, 'Input.insertText', { text: message }, 10_000);
   const inputConfirmed = await waitUntil(async () => {
@@ -1097,7 +1223,7 @@ async function directDesktopSend(rpc) {
   if (!inputConfirmed) return {
     ok: false, errorCode: 'desktop_input_not_confirmed',
     message: '插件已聚焦输入框，但未确认完整任务文本已写入，未发送。',
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
   };
 
   const sendButton = await waitUntil(async () => evaluate(desktopSendButtonExpression()), 5_000);
@@ -1119,21 +1245,439 @@ async function directDesktopSend(rpc) {
   if (!sentState?.messageConfirmed) return {
     ok: false, errorCode: 'desktop_message_not_confirmed',
     message: '插件完成提交动作，但未在桌面 ChatGPT 中找到对应用户消息气泡，不能判定为已发送。',
-    backgroundOnly: true, workerUsed: false, surface: 'chat', port,
+    ...runtimeMetadata(surface), workerUsed: false, surface: 'chat', port,
     connector, connectorConfirmed, inputConfirmed: true,
   };
   const conversationId = desktopConversationId(sentState.conversationId)
     || desktopConversationId(surface.conversationId);
+  const role = args.role === 'planner' ? 'planner' : 'work';
   return {
     ok: true, sent: true, messageConfirmed: true, connector,
     connectorConfirmed: connector ? true : false,
-    inputConfirmed: true, surface: 'chat', backgroundOnly: true, workerUsed: false,
+    inputConfirmed: true, surface: 'chat', ...runtimeMetadata(sentState), workerUsed: false,
     port, targetId: target.id, conversationId,
     chatUrl: String(sentState.url || '').startsWith('https://chatgpt.com/')
       ? sentState.url : null,
     monitorStarted: false,
+    role,
+    autoPlanAfterWork: role === 'work' && args.autoPlanAfterWork !== false,
+    originalGoal: String(args.originalGoal || rawMessage).trim().slice(0, 10000),
+    taskId: args.taskId == null ? null : String(args.taskId).trim().slice(0, 128),
+    appliedRevision: Number.isInteger(args.appliedRevision) ? args.appliedRevision : null,
+    appliedDigest: args.appliedDigest == null ? null : String(args.appliedDigest).trim().slice(0, 256),
+    sentPrompt: message,
+    beforeUserMessageCount,
+    beforeAssistantCount,
     sentAt: new Date().toISOString(),
   };
+}
+
+function directDesktopRoundArguments(baseArgs, current, overrides = {}) {
+  const originalGoal = stripDesktopTaskReportContract(
+    String(baseArgs.originalGoal || current?.originalGoal || baseArgs.message || '').trim(),
+  );
+  return {
+    ...baseArgs,
+    ...overrides,
+    directDesktop: true,
+    backgroundPort: current.port,
+    backgroundTargetId: current.targetId,
+    newChat: true,
+    resumeExisting: false,
+    originalGoal,
+    taskId: current.taskId ?? baseArgs.taskId ?? null,
+    appliedRevision: current.appliedRevision ?? baseArgs.appliedRevision ?? null,
+    appliedDigest: current.appliedDigest ?? baseArgs.appliedDigest ?? null,
+  };
+}
+
+async function watchDirectDesktopOrchestration(baseArgs, firstDispatch) {
+  let current = firstDispatch;
+  let handoffCount = 0;
+  let recoveryAttempts = 0;
+  let noFinalReplyRetries = 0;
+  let emptyWorkResultAttempts = 0;
+  let plannerRetryAttempts = 0;
+  let latestWorkResult = '';
+  const maxRecoveryAttempts = Math.min(5, Math.max(
+    0, Number(baseArgs.maxRecoveryAttempts ?? 5),
+  ));
+  const maxTaskContinuations = Math.max(0, Number(baseArgs.maxTaskContinuations ?? 0));
+  const timeoutMs = Math.min(6 * 60 * 60 * 1000, Math.max(
+    10_000, Number(baseArgs.timeout || 21_600) * 1000,
+  ));
+  const stagnationMs = Math.min(3 * 60 * 60 * 1000, Math.max(
+    60_000, Number(baseArgs.stagnationTimeout || 10_800) * 1000,
+  ));
+  const noFinalReplyMs = Math.min(
+    stagnationMs,
+    Math.max(30_000, Number(baseArgs.noFinalReplyTimeout || 300) * 1000),
+  );
+  const pollIntervalMs = Math.min(5_000, Math.max(
+    200, Number(baseArgs.pollIntervalMs || 500),
+  ));
+  const originalGoal = stripDesktopTaskReportContract(
+    String(baseArgs.originalGoal || firstDispatch.originalGoal || baseArgs.message || '').trim(),
+  );
+
+  const failure = (errorCode, message, extra = {}) => ({
+    ...current,
+    ok: false,
+    errorCode,
+    message,
+    monitorStarted: true,
+    naturalWorkResult: latestWorkResult,
+    handoffCount,
+    recoveryAttempts,
+    ...extra,
+  });
+
+  while (true) {
+    const port = Number(current.port || desktopCDPPort(baseArgs));
+    const targetId = String(current.targetId || '').trim();
+    let target = await desktopTarget(port, targetId);
+    if (!target || target.id !== targetId) {
+      return failure(
+        'desktop_plugin_chat_target_lost',
+        '插件专用桌面 ChatGPT 目标已失效；没有切换到用户自己的窗口。',
+        { runtimeState: 'unavailable', backgroundOnly: false },
+      );
+    }
+
+    const role = current.role === 'planner' ? 'planner' : 'work';
+    const prefix = String(current.sentPrompt || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    const beforeAssistantCount = Number(current.beforeAssistantCount || 0);
+    let stableSamples = 0;
+    let lastFingerprint = '';
+    let lastProgressAt = Date.now();
+    let latestState = null;
+    let handedOff = false;
+    let noFinalReplySince = null;
+    const roundDeadline = Date.now() + timeoutMs;
+
+    while (Date.now() < roundDeadline) {
+      target = await desktopTarget(port, targetId);
+      if (!target || target.id !== targetId) {
+        return failure(
+          'desktop_plugin_chat_target_lost',
+          '插件专用桌面 ChatGPT 目标在监督期间失效；没有切换到用户自己的窗口。',
+          { runtimeState: 'unavailable', backgroundOnly: false },
+        );
+      }
+      try {
+        const approval = await directDesktopApprove({ params: { arguments: {
+          directDesktop: true,
+          backgroundPort: port,
+          backgroundTargetId: targetId,
+          connector: current.connector || baseArgs.connector || '',
+        } } });
+        if (approval?.approved) current.approvals = Number(current.approvals || 0) + 1;
+        current.authorization = approval;
+      } catch (error) {
+        current.authorization = {
+          ok: false,
+          errorCode: 'desktop_approval_poll_failed',
+          message: String(error?.message || error),
+        };
+      }
+      latestState = await desktopEvaluate(target, desktopReplyStateExpression(prefix));
+      current.latestReply = String(latestState?.content || '').slice(-4000);
+      current.responseRunning = latestState?.streaming === true;
+      current.runtimeState = latestState?.runtimeState || 'unavailable';
+      current.backgroundOnly = latestState?.backgroundOnly === true;
+      const assistantCount = Number(latestState?.assistantMessageCount || 0);
+      const content = String(latestState?.content || '').trim();
+      const responseStarted = assistantCount > beforeAssistantCount;
+      const userTurnStarted = Number(latestState?.userMessageCount || 0)
+        > Number(current.beforeUserMessageCount || 0);
+      const noFinalReplyCandidate = latestState?.messageConfirmed === true
+        && userTurnStarted
+        && !responseStarted
+        && latestState?.streaming !== true;
+      if (noFinalReplyCandidate) {
+        if (noFinalReplySince == null) noFinalReplySince = Date.now();
+      } else {
+        noFinalReplySince = null;
+      }
+      const noFinalReplyDue = noFinalReplyCandidate
+        && Date.now() - Number(noFinalReplySince || Date.now()) >= noFinalReplyMs;
+      const fingerprint = `${assistantCount}:${content.length}:${content.slice(-240)}:${latestState?.streaming === true}`;
+      if (fingerprint !== lastFingerprint) {
+        lastFingerprint = fingerprint;
+        stableSamples = 0;
+        lastProgressAt = Date.now();
+      } else {
+        stableSamples += 1;
+      }
+
+      if (noFinalReplyDue) {
+        noFinalReplyRetries += 1;
+        recoveryAttempts += 1;
+        if (recoveryAttempts > maxRecoveryAttempts) {
+          return failure(
+            'no_final_reply_after_retries',
+            'Chat 会话已结束但没有最终回复；插件已关闭旧 Chat、用新的 Work Chat 重发原指令，并用尽自动重试次数。',
+            {
+              oldChatClosed: true,
+              oldChatPreserved: false,
+              continuationMode: 'fresh_chat_after_no_final_reply_exhausted',
+              noFinalReplyRetries,
+              sessionEndedWithoutFinalReply: true,
+            },
+          );
+        }
+        handoffCount += 1;
+        if (maxTaskContinuations > 0 && handoffCount > maxTaskContinuations) {
+          return failure(
+            'task_continuation_limit_reached',
+            'Chat 会话没有最终回复，且已达到调用方设置的 Chat 续作上限。',
+            { noFinalReplyRetries, sessionEndedWithoutFinalReply: true },
+          );
+        }
+        const retryMessage = stripDesktopTaskReportContract(
+          String(current.sentPrompt || baseArgs.message || originalGoal).trim(),
+        );
+        const retryArgs = directDesktopRoundArguments(baseArgs, current, {
+          message: role === 'planner' ? originalGoal : retryMessage,
+          role,
+          autoPlanAfterWork: role === 'work',
+          workResult: role === 'planner' ? latestWorkResult : '',
+        });
+        const retryDispatch = await directDesktopSend({
+          params: { arguments: retryArgs },
+        });
+        if (!retryDispatch?.ok) {
+          return failure(
+            'no_final_reply_recovery_failed',
+            'Chat 会话没有最终回复，且新的插件 Chat 尚未确认发送。',
+            {
+              oldChatClosed: true,
+              oldChatPreserved: false,
+              continuationMode: 'fresh_chat_after_no_final_reply',
+              noFinalReplyRetries,
+              sessionEndedWithoutFinalReply: true,
+              sendVerification: retryDispatch,
+            },
+          );
+        }
+        current = retryDispatch;
+        handedOff = true;
+        break;
+      }
+
+      if (!latestState?.streaming && responseStarted && stableSamples >= 3) {
+        if (role === 'work') {
+          latestWorkResult = stripDesktopTaskReportContract(content);
+          if (!latestWorkResult) {
+            emptyWorkResultAttempts += 1;
+            handoffCount += 1;
+            if (emptyWorkResultAttempts > maxRecoveryAttempts) {
+              return failure(
+                'work_natural_result_missing',
+                'Work Chat 已停止生成，但没有返回可交给规划 Chat 的自然语言结果；插件已用尽重试次数。',
+                {
+                  oldChatClosed: true,
+                  oldChatPreserved: false,
+                  continuationMode: 'fresh_chat_after_empty_work_result_exhausted',
+                  emptyWorkResultAttempts,
+                },
+              );
+            }
+            if (maxTaskContinuations > 0 && handoffCount > maxTaskContinuations) {
+              return failure(
+                'task_continuation_limit_reached',
+                'Work Chat 没有返回自然结果，且已达到调用方设置的 Chat 续作上限。',
+                { emptyWorkResultAttempts },
+              );
+            }
+            const retryMessage = stripDesktopTaskReportContract(
+              String(current.sentPrompt || baseArgs.message || originalGoal).trim(),
+            );
+            const retryArgs = directDesktopRoundArguments(baseArgs, current, {
+              message: retryMessage,
+              role: 'work',
+              autoPlanAfterWork: true,
+              workResult: '',
+            });
+            const retryDispatch = await directDesktopSend({
+              params: { arguments: retryArgs },
+            });
+            if (!retryDispatch?.ok) {
+              return failure(
+                'work_natural_result_recovery_failed',
+                'Work Chat 没有返回自然结果，且新的插件 Work Chat 尚未确认发送。',
+                {
+                  oldChatClosed: true,
+                  oldChatPreserved: false,
+                  continuationMode: 'fresh_chat_after_empty_work_result',
+                  emptyWorkResultAttempts,
+                  sendVerification: retryDispatch,
+                },
+              );
+            }
+            current = retryDispatch;
+            handedOff = true;
+            break;
+          }
+          emptyWorkResultAttempts = 0;
+          handoffCount += 1;
+          if (maxTaskContinuations > 0 && handoffCount > maxTaskContinuations) {
+            return failure(
+              'task_continuation_limit_reached',
+              '已达到调用方设置的 Chat 续作上限；插件保留当前自然结果。',
+            );
+          }
+          const plannerArgs = directDesktopRoundArguments(baseArgs, current, {
+            message: originalGoal,
+            role: 'planner',
+            autoPlanAfterWork: false,
+            workResult: latestWorkResult,
+          });
+          const plannerDispatch = await directDesktopSend({
+            params: { arguments: plannerArgs },
+          });
+          if (!plannerDispatch?.ok) {
+            return failure(
+              'planner_handoff_not_confirmed',
+              'Work Chat 已返回自然结果，但新的规划 Chat 尚未确认发送。',
+              { plannerHandoff: { started: false, sendVerification: plannerDispatch } },
+            );
+          }
+          current = plannerDispatch;
+          plannerRetryAttempts = 0;
+          handedOff = true;
+          break;
+        }
+
+        const parsed = parseTaskReport(content);
+        if (parsed.complete) {
+          return {
+            ...current,
+            ok: true,
+            sent: true,
+            monitorStarted: true,
+            role: 'planner',
+            taskReport: parsed.payload,
+            naturalWorkResult: latestWorkResult,
+            handoffCount,
+            recoveryAttempts,
+            runtimeState: latestState?.runtimeState || current.runtimeState || 'unavailable',
+            backgroundOnly: latestState?.backgroundOnly === true,
+            completedAt: new Date().toISOString(),
+          };
+        }
+        if (parsed.actionable) {
+          handoffCount += 1;
+          if (maxTaskContinuations > 0 && handoffCount > maxTaskContinuations) {
+            return failure(
+              'task_continuation_limit_reached',
+              '已达到调用方设置的 Chat 续作上限；插件保留规划 Chat 的 next_task。',
+              { taskReport: parsed.payload },
+            );
+          }
+          const nextTask = stripDesktopTaskReportContract(parsed.payload.next_task);
+          const nextConnector = String(parsed.payload.next_connector || '').trim();
+          const workArgs = directDesktopRoundArguments(baseArgs, current, {
+            message: nextTask,
+            role: 'work',
+            autoPlanAfterWork: true,
+            connector: nextConnector || current.connector || baseArgs.connector || null,
+            workResult: '',
+          });
+          const workDispatch = await directDesktopSend({
+            params: { arguments: workArgs },
+          });
+          if (!workDispatch?.ok) {
+            return failure(
+              'work_handoff_not_confirmed',
+              '规划 Chat 已给出 next_task，但新的 Work Chat 尚未确认发送。',
+              { taskReport: parsed.payload },
+            );
+          }
+          current = workDispatch;
+          latestWorkResult = '';
+          handedOff = true;
+          break;
+        }
+
+        plannerRetryAttempts += 1;
+        if (plannerRetryAttempts > maxRecoveryAttempts) {
+          return failure(
+            'task_report_missing',
+            '规划 Chat 已停止生成，但在自动重试后仍没有有效的 MAHAYANA_TASK_REPORT_V1。',
+            { taskReport: null, plannerRetryAttempts },
+          );
+        }
+        const retryPlannerArgs = directDesktopRoundArguments(baseArgs, current, {
+          message: originalGoal,
+          role: 'planner',
+          autoPlanAfterWork: false,
+          workResult: latestWorkResult,
+        });
+        const retryDispatch = await directDesktopSend({
+          params: { arguments: retryPlannerArgs },
+        });
+        if (!retryDispatch?.ok) {
+          return failure(
+            'planner_handoff_not_confirmed',
+            '规划 Chat 回执无效，且新的规划 Chat 尚未确认发送。',
+            { plannerRetryAttempts, sendVerification: retryDispatch },
+          );
+        }
+        current = retryDispatch;
+        handedOff = true;
+        break;
+      }
+
+      if (Date.now() - lastProgressAt >= stagnationMs) {
+        recoveryAttempts += 1;
+        if (recoveryAttempts > maxRecoveryAttempts) {
+          return failure(
+            'page_stalled',
+            `桌面 ChatGPT 连续 ${Math.floor(stagnationMs / 1000)} 秒没有新内容，已用尽自动恢复次数。`,
+            { oldChatClosed: false, continuationMode: 'fresh_chat_after_stall_exhausted' },
+          );
+        }
+        handoffCount += 1;
+        if (maxTaskContinuations > 0 && handoffCount > maxTaskContinuations) {
+          return failure(
+            'task_continuation_limit_reached',
+            '页面无进展且已达到调用方设置的 Chat 续作上限。',
+          );
+        }
+        const retryMessage = stripDesktopTaskReportContract(
+          String(current.sentPrompt || baseArgs.message || originalGoal).trim(),
+        );
+        const retryArgs = directDesktopRoundArguments(baseArgs, current, {
+          message: role === 'planner' ? originalGoal : retryMessage,
+          role,
+          autoPlanAfterWork: role === 'work',
+          workResult: role === 'planner' ? latestWorkResult : '',
+        });
+        const retryDispatch = await directDesktopSend({
+          params: { arguments: retryArgs },
+        });
+        if (!retryDispatch?.ok) {
+          return failure(
+            'desktop_stall_recovery_failed',
+            '桌面 ChatGPT 页面无进展，且新的插件 Chat 尚未确认发送。',
+            { oldChatClosed: true, continuationMode: 'fresh_chat_after_stall' },
+          );
+        }
+        current = retryDispatch;
+        handedOff = true;
+        break;
+      }
+      await sleep(pollIntervalMs);
+    }
+
+    if (handedOff) continue;
+    return failure(
+      'watch_timeout',
+      `等待桌面 ChatGPT 最终结果超过 ${Math.floor(timeoutMs / 1000)} 秒。`,
+      { oldChatClosed: false, lastReply: latestState?.content || '' },
+    );
+  }
 }
 
 async function runDirectDesktopTool(rpc) {
@@ -1147,7 +1691,7 @@ async function runDirectDesktopTool(rpc) {
     } catch (error) {
       approved = {
         ok: false, errorCode: 'desktop_approval_failed', message: String(error?.message || error),
-        backgroundOnly: true, workerUsed: false, surface: 'chat',
+        backgroundOnly: false, runtimeState: 'unavailable', workerUsed: false, surface: 'chat',
       };
     }
     return nativeToolResponse(rpc, tool, approved);
@@ -1166,30 +1710,77 @@ async function runDirectDesktopTool(rpc) {
       ok: false,
       errorCode: 'desktop_send_failed',
       message: String(error?.message || error),
-      backgroundOnly: true,
+      backgroundOnly: false,
+      runtimeState: 'unavailable',
       workerUsed: false,
       surface: 'chat',
     };
   }
   if (!dispatched?.ok) return nativeToolResponse(rpc, tool, dispatched);
   const jobId = `desktop_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  desktopDirectJobs.set(jobId, {
+  const jobRecord = {
     id: jobId,
-    status: 'dispatched',
+    status: 'running',
     conversationId: dispatched.conversationId,
     connector: dispatched.connector,
+    role: dispatched.role,
+    originalGoal: dispatched.originalGoal,
+    taskId: dispatched.taskId,
     sentAt: dispatched.sentAt,
-  });
+  };
+  desktopDirectJobs.set(jobId, jobRecord);
+  let watched;
+  try {
+    watched = await watchDirectDesktopOrchestration(
+      { ...(rpc.params?.arguments || {}), directDesktop: true },
+      dispatched,
+    );
+  } catch (error) {
+    watched = {
+      ...dispatched,
+      ok: false,
+      errorCode: 'desktop_watch_failed',
+      message: String(error?.message || error),
+      monitorStarted: true,
+    };
+  }
+  const finalRecord = {
+    ...jobRecord,
+    status: watched?.ok ? 'completed' : 'failed',
+    conversationId: watched?.conversationId || dispatched.conversationId,
+    role: watched?.role || dispatched.role,
+    updatedAt: new Date().toISOString(),
+  };
+  desktopDirectJobs.set(jobId, finalRecord);
   return nativeToolResponse(rpc, tool, {
-    ...dispatched,
+    ...watched,
     jobId,
-    monitorStarted: false,
-    message: '插件已在桌面 ChatGPT Chat 中确认发送；后续监督可绑定此 jobId。',
+    message: watched?.ok
+      ? '插件已完成桌面 ChatGPT 的工作→规划→下一轮编排。'
+      : (watched?.message || '插件桌面 ChatGPT 编排未完成。'),
   });
 }
 
 async function runInAppBrowserTool(rpc) {
   const tool = String(rpc.params?.name ?? '');
+  if (tool === 'browser_reply_handoff') {
+    const descriptor = await readBrowserCapability();
+    if (!descriptor.ok) return browserToolResponse(rpc, tool, descriptor);
+    const requested = { ...(rpc.params?.arguments || {}) };
+    // MCP calls made from a local Work turn do not need to copy their own
+    // thread id into the prompt. Codex exposes the exact current thread to
+    // the per-host process; an explicit argument still wins for recovery or
+    // an operator-owned Work thread.
+    if (requested.action === 'register' && !String(requested.threadId || '').trim()) {
+      const currentThreadId = String(process.env.CODEX_THREAD_ID || '').trim();
+      if (currentThreadId) requested.threadId = currentThreadId;
+    }
+    const result = await callBrowserCapability(descriptor, '/v1/reply-handoff', 'POST', requested);
+    if (result?.ok && requested.action === 'register') {
+      startReplyHandoffSupervisor();
+    }
+    return browserToolResponse(rpc, tool, result);
+  }
   if (!new Set(['dispatch_goal', 'browser_capability_status', 'browser_job_status', 'browser_stop', 'browser_watch']).has(tool)) return null;
   if (tool === 'browser_watch') {
     const persistedJobs = await readPersistedBrowserJobs();
@@ -1202,6 +1793,9 @@ async function runInAppBrowserTool(rpc) {
       ? await callBrowserCapability(descriptor, '/v1/capability', 'GET', undefined, 5_000)
       : descriptor;
     const jobs = resultBrowserJobs(health, persistedJobs);
+    if (replyHandoffWatches(health).some(watch => !replyHandoffTerminalStatuses.has(watch.status))) {
+      startReplyHandoffSupervisor();
+    }
     const reattachJobs = waitingForBrowserHost(jobs);
     const reattachRequired = !descriptor.ok || !health?.ok
       || health?.reattachRequired === true
@@ -1280,6 +1874,9 @@ async function runInAppBrowserTool(rpc) {
   }
   if (tool === 'browser_capability_status') {
     const result = await callBrowserCapability(descriptor, '/v1/capability');
+    if (replyHandoffWatches(result).some(watch => !replyHandoffTerminalStatuses.has(watch.status))) {
+      startReplyHandoffSupervisor();
+    }
     maybeStartBrowserSupervisor(result);
     const jobs = resultBrowserJobs(result);
     const reattachJobs = waitingForBrowserHost(jobs);
@@ -1329,6 +1926,15 @@ async function runInAppBrowserTool(rpc) {
     reattach: reattachRequired ? browserReattachMetadata(reattachJobs[0]) : null,
     reattachments: reattachJobs.map(browserReattachMetadata),
   } : result);
+}
+
+function runLocalWorkBridgeTool(rpc) {
+  const tool = String(rpc.params?.name ?? '');
+  if (tool !== 'work_bridge_status') return null;
+  return nativeToolResponse(rpc, tool, {
+    ok: true,
+    ...localWorkBridgeDescriptor(),
+  });
 }
 
 function runWindowsCredentialTool(rpc) {
@@ -1440,6 +2046,7 @@ function runNativeTool(rpc) {
 // started. The supervisor waits for a newly authorized Browser host if the
 // previous host/context was closed, so a later timer tick can resume it.
 void resumePersistedBrowserSupervisor();
+void resumePersistedReplyHandoffSupervisor();
 
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of lines) {
@@ -1457,10 +2064,13 @@ for await (const line of lines) {
   const browserResponse = rpc.method === 'tools/call'
     ? await runInAppBrowserTool(rpc)
     : null;
+  const localWorkBridgeResponse = rpc.method === 'tools/call'
+    ? runLocalWorkBridgeTool(rpc)
+    : null;
   const directResponse = rpc.method === 'tools/call'
     ? await runDirectDesktopTool(rpc)
     : null;
-  const nativeResponse = browserResponse || directResponse || (rpc.method === 'tools/call'
+  const nativeResponse = browserResponse || localWorkBridgeResponse || directResponse || (rpc.method === 'tools/call'
     ? (runWindowsCredentialTool(rpc) || runNativeTool(rpc))
     : null);
   if (nativeResponse) {

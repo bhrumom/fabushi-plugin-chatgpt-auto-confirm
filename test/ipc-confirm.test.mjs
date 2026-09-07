@@ -311,7 +311,7 @@ test('CDP WebSocket & Unix IPC primary path integration test', async t => {
   assert.deepEqual([...evaluatedTargets].sort(), evaluatedBeforeScan);
   assert.ok(evaluateExpressionReceived);
 
-  // 5. No authorization audit is emitted when no owned hidden renderer exists.
+  // 5. No authorization audit is emitted when no owned plugin renderer exists.
   const { stdout: auditStdout } = await execFileAsync(nativeBinary, ['audit', '10'], { env });
   const auditRes = JSON.parse(auditStdout);
   assert.equal(auditRes.ok, true);

@@ -1,3 +1,5 @@
+import { ReplyHandoff, handoffAvailable } from './reply-handoff.mjs';
+import { createLocalWorkBridge } from './local-work-bridge.mjs';
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
@@ -24,9 +26,12 @@ const DEFAULT_JOB_FILE = resolve(
 );
 const MAX_GOAL_LENGTH = 10_000;
 export const MAX_PARALLEL_BROWSER_JOBS = 2;
-const MAX_ATTEMPTS = 10_000;
 const DEFAULT_TIMEOUT_SECONDS = 21_600;
 const DEFAULT_STAGNATION_SECONDS = 10_800;
+// A sent user turn can leave the Browser page looking idle without ever
+// creating a final assistant turn. Recover that bounded failure in a fresh
+// Chat instead of waiting for the multi-hour stagnation watchdog.
+const DEFAULT_NO_FINAL_REPLY_SECONDS = 300;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const configuredBrowserLeaseValue = typeof process === 'undefined'
   ? ''
@@ -66,10 +71,13 @@ export const BROWSER_DISPATCH_POLICY = Object.freeze({
   surface: 'chat',
   newChat: true,
   resumeExisting: false,
-  goalOnlyDispatch: true,
+  // Kept as a compatibility field for older callers; the controller now
+  // always performs the Work -> fresh planner -> raw next_task Work handoff.
+  goalOnlyDispatch: false,
   approveAll: true,
   timeout: DEFAULT_TIMEOUT_SECONDS,
   stagnationTimeout: DEFAULT_STAGNATION_SECONDS,
+  noFinalReplyTimeout: DEFAULT_NO_FINAL_REPLY_SECONDS,
   maxRecoveryAttempts: 5,
   autoContinueIncomplete: true,
   maxTaskContinuations: 0,
@@ -78,10 +86,50 @@ export const BROWSER_DISPATCH_POLICY = Object.freeze({
   pollIntervalMs: DEFAULT_POLL_INTERVAL_MS,
 });
 
-export const COMPLETION_CERTIFICATE_INSTRUCTION = `完成整个目标后，在回复末尾只输出以下完成回执；未完成时不要伪造 complete，继续工作：
+export const COMPLETION_CERTIFICATE_INSTRUCTION = `MAHAYANA_TASK_REPORT_CONTRACT_V6
+你是规划/验收 Chat，不是工作 Chat。请根据工作 Chat 的自然结果和当前 checkout 的实际状态决定下一步安排。
+必须在回复末尾输出一次且仅一次 MAHAYANA_TASK_REPORT_V1。完成时使用 status=complete、all_tasks_complete=true、remaining=[]、blockers=[]、next_task=""；未完成或被阻塞时使用 status=incomplete 或 blocked、all_tasks_complete=false，并把下一轮工作 Chat 要执行的完整安排写入 next_task。不要把规划说明或模板要求转发给工作 Chat。
 MAHAYANA_TASK_REPORT_V1_BEGIN
 {"protocol":"mahayana.task-report.v1","status":"complete","all_tasks_complete":true,"summary":"整个目标已完成","completed":["列出已完成项目和发布证据"],"remaining":[],"blockers":[],"verification":["列出可复核的验证证据"],"wait_seconds":0,"wait_reason":"","next_connector":"","next_task":""}
 MAHAYANA_TASK_REPORT_V1_END`;
+
+const TASK_REPORT_MARKERS = [
+  'MAHAYANA_TASK_REPORT_CONTRACT_V6',
+  'MAHAYANA_TASK_REPORT_CONTRACT_V5',
+  'MAHAYANA_TASK_REPORT_V1_BEGIN',
+];
+
+function stripTaskReportContract(value) {
+  let message = String(value || '').trim();
+  for (const marker of TASK_REPORT_MARKERS) {
+    const markerIndex = message.indexOf(marker);
+    if (markerIndex >= 0) message = message.slice(0, markerIndex).trim();
+  }
+  return message;
+}
+
+function plannerReportContract({ taskId = 'CURRENT_TASK_ID', revision = 1, digest = 'CURRENT_SPEC_DIGEST' } = {}) {
+  return `${COMPLETION_CERTIFICATE_INSTRUCTION.replace(
+    '{"protocol":"mahayana.task-report.v1"',
+    `{"protocol":"mahayana.task-report.v1","task_id":${JSON.stringify(String(taskId || 'CURRENT_TASK_ID'))},"applied_task_revision":${Number.isInteger(revision) ? revision : 1},"applied_spec_digest":${JSON.stringify(String(digest || 'CURRENT_SPEC_DIGEST'))}`,
+  )}`;
+}
+
+export function plannerPromptForGoal(originalGoal, workResult, metadata = {}) {
+  const goal = stripTaskReportContract(originalGoal);
+  const result = stripTaskReportContract(workResult);
+  return [
+    '你是本轮任务的规划/验收 Chat。插件刚刚从一个独立的工作 Chat 收到自然语言结果。请读取同一 checkout 的最新落盘状态、项目记录和验证证据，判断原始目标是否真正完成，并决定下一轮是否需要继续。',
+    '你负责规划、验收和编排，不要代替工作 Chat 执行实现。只有你可以输出 MAHAYANA_TASK_REPORT_V1；如果未完成或被阻塞，必须把下一轮工作 Chat 应直接执行的完整安排写入 next_task。插件会把 next_task 原文发送给新的工作 Chat，工作 Chat 不会收到本模板。',
+    `原始总目标 BEGIN\n${goal}\n原始总目标 END`,
+    `工作 Chat 自然结果 BEGIN\n${result || '本轮没有返回稳定的自然语言结果，请检查 checkout 后决定下一步。'}\n工作 Chat 自然结果 END`,
+    plannerReportContract({
+      taskId: metadata.taskId,
+      revision: metadata.appliedRevision,
+      digest: metadata.appliedDigest,
+    }),
+  ].join('\n\n');
+}
 
 const sleep = milliseconds => new Promise(resolvePromise => {
   setTimeout(resolvePromise, milliseconds);
@@ -266,6 +314,17 @@ function isReusableBrowserJobUrl(job, currentUrl, targetUrl) {
   return sameChatTarget(currentUrl, targetUrl);
 }
 
+function isReusableOwnedBrowserJobUrl(job, currentUrl, targetUrl) {
+  if (isReusableBrowserJobUrl(job, currentUrl, targetUrl)) return true;
+  // A handoff/retry owns the exact previously bound tab. Reuse that tab and
+  // let runBrowserStep navigate it to the project entry/new Chat; otherwise a
+  // fresh planner or Work round would create an unnecessary extra tab while
+  // the job is supposed to keep one monitored tab per platform.
+  const phase = job?.phase || 'accepted';
+  const targetConversation = canonicalChatUrl(targetUrl).match(/\/c\/([^/]+)$/u)?.[1] || '';
+  return phase !== 'accepted' && !targetConversation && !!canonicalChatUrl(currentUrl);
+}
+
 function browserTabFailureReason(currentUrl) {
   const url = String(currentUrl || '');
   if (CRASH_PAGE_URL_PATTERN.test(url)) return '检测到内置 Browser 崩溃页面';
@@ -273,12 +332,13 @@ function browserTabFailureReason(currentUrl) {
   return '标签页不再属于该任务的受控会话';
 }
 
-export function promptForGoal(goal) {
+export function promptForGoal(goal, { role = 'work', workResult = '', ...metadata } = {}) {
   const value = String(goal ?? '').trim();
   if (!value || value.length > MAX_GOAL_LENGTH) {
     throw new Error('goal 必须是 1-10000 字符的非空目标文本');
   }
-  return `${value}\n\n${COMPLETION_CERTIFICATE_INSTRUCTION}`;
+  if (role === 'planner') return plannerPromptForGoal(value, workResult, metadata);
+  return `${stripTaskReportContract(value)}\n\n本轮是工作 Chat：请直接执行以上目标，并在回复中给出自然语言工作结果。不要输出规划/验收 Chat 的固定回执、完成回执、未完成回执或下一步模板。`;
 }
 
 export function validateBrowserPolicy(policy) {
@@ -294,38 +354,79 @@ export function validateBrowserPolicy(policy) {
     : { ok: true };
 }
 
-export function parseCompletionCertificate(text) {
+export function parseTaskReport(text) {
   const source = String(text ?? '');
   const beginIndex = source.lastIndexOf(REPORT_BEGIN);
   const endIndex = beginIndex === -1 ? -1 : source.indexOf(REPORT_END, beginIndex + REPORT_BEGIN.length);
   if (beginIndex === -1 || endIndex === -1) {
-    return { valid: false, reason: 'missing-completion-certificate', payload: null };
+    return { present: false, valid: false, complete: false, reason: 'missing-completion-certificate', payload: null };
   }
   const raw = source.slice(beginIndex + REPORT_BEGIN.length, endIndex).trim();
   let payload;
   try {
     payload = JSON.parse(raw);
   } catch {
-    return { valid: false, reason: 'completion-certificate-json-invalid', payload: null };
+    return { present: true, valid: false, complete: false, reason: 'completion-certificate-json-invalid', payload: null };
   }
-  const valid = isRecord(payload)
+  const shapeValid = isRecord(payload)
     && payload.protocol === 'mahayana.task-report.v1'
-    && payload.status === 'complete'
-    && payload.all_tasks_complete === true
+    && ['complete', 'incomplete', 'blocked'].includes(payload.status)
+    && typeof payload.all_tasks_complete === 'boolean'
     && typeof payload.summary === 'string' && payload.summary.trim().length > 0
     && Array.isArray(payload.completed) && payload.completed.length > 0
-    && Array.isArray(payload.remaining) && payload.remaining.length === 0
-    && Array.isArray(payload.blockers) && payload.blockers.length === 0
-    && Array.isArray(payload.verification) && payload.verification.length > 0
+    && Array.isArray(payload.remaining)
+    && Array.isArray(payload.blockers)
+    && Array.isArray(payload.verification)
+    && Number.isInteger(payload.wait_seconds) && payload.wait_seconds >= 0
+    && typeof payload.wait_reason === 'string'
+    && typeof payload.next_connector === 'string'
+    && typeof payload.next_task === 'string';
+  const complete = shapeValid
+    && payload.status === 'complete'
+    && payload.all_tasks_complete === true
+    && payload.remaining.length === 0
+    && payload.blockers.length === 0
+    && payload.verification.length > 0
     && payload.wait_seconds === 0
     && payload.wait_reason === ''
-    && typeof payload.next_connector === 'string'
     && payload.next_task === '';
+  const actionable = shapeValid
+    && ['incomplete', 'blocked'].includes(payload.status)
+    && payload.all_tasks_complete === false
+    && payload.next_task.trim().length > 0;
   return {
-    valid,
-    reason: valid ? 'complete' : 'completion-certificate-fields-invalid',
-    payload: valid ? payload : null,
+    present: true,
+    valid: complete || actionable,
+    complete,
+    actionable,
+    reason: complete ? 'complete' : actionable ? 'incomplete' : 'completion-certificate-fields-invalid',
+    payload: complete || actionable ? payload : null,
   };
+}
+
+export function parseCompletionCertificate(text) {
+  const report = parseTaskReport(text);
+  return {
+    valid: report.complete === true,
+    reason: report.complete
+      ? 'complete'
+      : report.reason || 'missing-completion-certificate',
+    payload: report.complete ? report.payload : null,
+  };
+}
+
+function classifyWorkResult(text) {
+  const source = stripTaskReportContract(text);
+  return source
+    ? { valid: true, mode: 'natural', reason: 'natural-result', naturalResult: source }
+    : { valid: false, mode: 'none', reason: 'empty-natural-result' };
+}
+
+function classifyPlannerResult(text) {
+  const report = parseTaskReport(text);
+  if (report.complete) return { valid: true, mode: 'certificate', report, certificate: { valid: true, payload: report.payload } };
+  if (report.actionable) return { valid: true, mode: 'planner-next-task', report };
+  return { valid: false, mode: 'planner', reason: report.reason, report };
 }
 
 const NATURAL_INCOMPLETE_PATTERN = /(?:尚未(?:完成|实现|通过|验证)|(?:未|没有|尚无|还没).{0,16}(?:完成|实现|通过|验证)|仍(?:需|要|在).{0,16}(?:继续|完成|处理|验证)|还需要|仍需|阻塞|无法.{0,24}(?:完成|验证|实现)|不能.{0,24}(?:声称|报告|返回).{0,12}(?:完成|complete)|not\s+yet|incomplete|still\s+(?:in progress|needs?|has?\s+to)|blocked|pending|remaining|todo|next\s+step)/iu;
@@ -394,7 +495,7 @@ async function readPageState(tab) {
       }));
     const bodyText = document.body?.innerText || '';
     const bodyLower = bodyText.toLowerCase();
-    const stopAnswer = controls.some(control => /停止回答|停止生成|stop generating|stop responding/iu.test(control.label));
+    const stopAnswer = controls.some(control => /停止回答|停止生成|stop generating|stop responding|stop answering/iu.test(control.label));
     const retry = controls.some(control => /重试|retry|重新生成|regenerate/iu.test(control.label));
     const conversationMarker = document.querySelector('[data-above-composer-conversation-id]')
       ?.getAttribute('data-above-composer-conversation-id') || '';
@@ -449,6 +550,7 @@ export async function reattachInAppBrowserTab({
   browser,
   targetUrl,
   preferredTabId = null,
+  allowPreferredChatTab = false,
   fallbackUrl = 'https://chatgpt.com/',
   logger = () => {},
 } = {}) {
@@ -465,8 +567,13 @@ export async function reattachInAppBrowserTab({
       const tab = await browser.tabs.get(preferredTabId);
       const url = typeof tab.url === 'function' ? await tab.url() : '';
       const targetConversation = destination.match(/\/c\/([^/]+)$/u)?.[1] || '';
+      const preferredChatMatch = allowPreferredChatTab
+        && !targetConversation
+        && !!canonicalChatUrl(url);
       const targetMatches = canonicalChatUrl(url)
-        ? (targetConversation ? sameChatTarget(url, destination) : sameChatProject(url, destination))
+        ? (targetConversation
+          ? sameChatTarget(url, destination)
+          : (sameChatProject(url, destination) || preferredChatMatch))
         // A persisted owned tab may be a renderer crash page. It is handled
         // below as a stale recovery hint rather than a usable Browser handle.
         : OWNED_BROKEN_TAB_URL_PATTERN.test(url);
@@ -979,67 +1086,6 @@ async function sendGoal(tab, prompt) {
   return { ok: false, before, state: await readPageState(tab), errorCode: 'message_send_not_confirmed' };
 }
 
-async function waitForResponse(tab, job, before, policy) {
-  const deadline = Date.now() + Number(policy.timeout || DEFAULT_TIMEOUT_SECONDS) * 1000;
-  const stagnationDeadline = Number(policy.stagnationTimeout || DEFAULT_STAGNATION_SECONDS) * 1000;
-  const pollInterval = Math.min(5000, Math.max(200, Number(policy.pollIntervalMs || DEFAULT_POLL_INTERVAL_MS)));
-  const initialAssistantCount = before.assistantCount;
-  const initialUserCount = before.userCount;
-  let sawResponse = false;
-  let stableSamples = 0;
-  let lastFingerprint = '';
-  let lastProgressAt = Date.now();
-  let authorizationAttempts = 0;
-  let latestState = before;
-  while (Date.now() < deadline) {
-    if (job.stopRequested) return { kind: 'stopped', state: latestState };
-    latestState = await readPageState(tab);
-    job.currentUrl = latestState.url;
-    job.conversationId = conversationIdFromState(latestState);
-    job.latestReply = latestState.latestAssistantText.slice(-4000);
-    job.responseRunning = latestState.stopAnswer;
-    if (latestState.pendingAuthorization) {
-      job.status = 'waiting_for_authorization';
-      const approval = await approveAuthorization(tab);
-      if (!approval.ok) {
-        authorizationAttempts += 1;
-        job.authorization = approval;
-        if (authorizationAttempts >= 5) return { kind: 'blocked', state: latestState, approval };
-      } else if (approval.found) {
-        job.authorization = approval;
-        job.status = 'running';
-        lastProgressAt = Date.now();
-      }
-    }
-    const responseCountChanged = latestState.assistantCount > initialAssistantCount;
-    const userMessageConfirmed = latestState.userCount > initialUserCount
-      && latestState.latestUserText.length > 0;
-    if (responseCountChanged || (latestState.url.includes('/c/') && userMessageConfirmed)) {
-      sawResponse = sawResponse || responseCountChanged;
-    }
-    const fingerprint = `${latestState.assistantCount}:${latestState.latestAssistantText.length}:${latestState.latestAssistantText.slice(-240)}`;
-    if (fingerprint !== lastFingerprint) {
-      lastFingerprint = fingerprint;
-      lastProgressAt = Date.now();
-      stableSamples = 0;
-    } else {
-      stableSamples += 1;
-    }
-    if (!latestState.stopAnswer && sawResponse && stableSamples >= 3) {
-      const completion = classifyCompletion(latestState.latestAssistantText || latestState.bodyText);
-      if (completion.valid) return { kind: 'complete', state: latestState, completion };
-      return { kind: 'incomplete', state: latestState, completion };
-    }
-    if (Date.now() - lastProgressAt >= stagnationDeadline) {
-      return { kind: 'stagnated', state: latestState };
-    }
-    job.status = latestState.stopAnswer ? 'running' : (sawResponse ? 'settling' : 'starting');
-    job.updatedAt = new Date().toISOString();
-    await sleep(pollInterval);
-  }
-  return { kind: 'timed-out', state: latestState };
-}
-
 function hostJobs(host) {
   if (!(host.jobs instanceof Map)) host.jobs = new Map();
   if (host.activeJob?.id && !host.jobs.has(host.activeJob.id)) {
@@ -1072,6 +1118,15 @@ function persistedJob(job) {
   return {
     id: job.id,
     goal: job.goal,
+    originalGoal: job.originalGoal || job.goal,
+    nextTask: job.nextTask || '',
+    workResult: job.workResult || '',
+    role: job.role || 'work',
+    dispatchedMessage: job.dispatchedMessage || '',
+    plannerConversationId: job.plannerConversationId || null,
+    appliedRevision: Number.isInteger(job.appliedRevision) ? job.appliedRevision : null,
+    appliedDigest: job.appliedDigest || null,
+    certificate: job.certificate || null,
     status: job.status,
     phase: job.phase || 'accepted',
     attempt: job.attempt || 0,
@@ -1088,6 +1143,7 @@ function persistedJob(job) {
     beforeAssistantCount: job.beforeAssistantCount || 0,
     beforeUserCount: job.beforeUserCount || 0,
     stableSamples: job.stableSamples || 0,
+    emptyWorkResultAttempts: job.emptyWorkResultAttempts || 0,
     lastFingerprint: job.lastFingerprint || '',
     lastProgressAt: job.lastProgressAt || Date.now(),
     reattachCount: job.reattachCount || 0,
@@ -1286,7 +1342,7 @@ async function ensureBrowserJobTab(host, job) {
     let currentUrl = '';
     try {
       currentUrl = typeof job.tab.url === 'function' ? await job.tab.url() : '';
-      if (isReusableBrowserJobUrl(job, currentUrl, target)) {
+      if (isReusableOwnedBrowserJobUrl(job, currentUrl, target)) {
         return bindBrowserJobTab(host, job, job.tab, { url: currentUrl });
       }
       const revived = await reviveBrokenBrowserJobTab(host, job, job.tab, target);
@@ -1308,7 +1364,7 @@ async function ensureBrowserJobTab(host, job) {
       const tab = await host.browser.tabs.get(job.tabId);
       const target = browserRecoveryTarget(host, job);
       const currentUrl = typeof tab.url === 'function' ? await tab.url() : target;
-      if (isReusableBrowserJobUrl(job, currentUrl, target)) {
+      if (isReusableOwnedBrowserJobUrl(job, currentUrl, target)) {
         return bindBrowserJobTab(host, job, tab, { method: 'controlled-tab', url: currentUrl });
       }
       const revived = await reviveBrokenBrowserJobTab(host, job, tab, target);
@@ -1336,6 +1392,8 @@ async function recoverBrowserHostTab(host, job) {
     browser: host.browser,
     targetUrl,
     preferredTabId: job.tabId || null,
+    allowPreferredChatTab: (job.phase || 'accepted') !== 'accepted'
+      && !conversationIdFromUrl(targetUrl),
     fallbackUrl: host.newChatUrl,
     logger: host.logger,
   });
@@ -1384,6 +1442,90 @@ function readyForLeaseDrain(job) {
     || (job.phase === 'accepted' && job.responseRunning !== true);
 }
 
+function resetBrowserResponseState(job) {
+  job.beforeAssistantCount = 0;
+  job.beforeUserCount = 0;
+  job.stableSamples = 0;
+  job.lastFingerprint = '';
+  job.responseRunning = false;
+  job.noFinalReplySince = null;
+  job.currentUrl = job.currentUrl || null;
+}
+
+function handoffWorkResultToPlanner(job, state, reason = 'work_natural_result') {
+  const naturalResult = stripTaskReportContract(state?.latestAssistantText || '').trim();
+  if (!naturalResult) return false;
+  job.workResult = naturalResult;
+  job.role = 'planner';
+  job.phase = 'planner_pending';
+  job.status = 'handoff_to_fresh_chat';
+  job.lastOutcome = {
+    kind: 'work-natural-result',
+    reason,
+    conversationId: conversationIdFromState(state),
+  };
+  job.plannerConversationId = null;
+  resetBrowserResponseState(job);
+  return true;
+}
+
+function retryWorkWithoutNaturalResult(job, state, policy = {}, reason = 'empty-natural-result') {
+  const noFinalReply = reason === 'no-final-reply';
+  const attemptsKey = noFinalReply ? 'noFinalReplyAttempts' : 'emptyWorkResultAttempts';
+  const attempts = Number(job[attemptsKey] || 0) + 1;
+  const configuredMaxAttempts = Number(policy.maxRecoveryAttempts);
+  const maxAttempts = Number.isFinite(configuredMaxAttempts)
+    ? Math.max(0, configuredMaxAttempts) : 5;
+  job[attemptsKey] = attempts;
+  if (attempts > maxAttempts) {
+    job.status = 'failed';
+    job.phase = 'terminal';
+    job.error = noFinalReply
+      ? 'Work Chat 会话已结束但没有最终回复；插件已关闭旧 Chat、用新的 Work Chat 重发原指令，并用尽重试次数。'
+      : 'Work Chat 已停止生成，但没有返回可交给规划 Chat 的自然语言结果；插件已用尽重试次数。';
+    job.lastOutcome = {
+      kind: 'work-natural-result-missing',
+      reason: noFinalReply ? 'no-final-reply-exhausted' : 'empty-natural-result-exhausted',
+      conversationId: conversationIdFromState(state),
+      sessionEndedWithoutFinalReply: noFinalReply,
+    };
+    return false;
+  }
+  job.nextTask = stripTaskReportContract(
+    job.dispatchedMessage || job.nextTask || job.originalGoal || job.goal,
+  );
+  job.role = 'work';
+  job.phase = 'work_pending';
+  job.status = 'handoff_to_fresh_chat';
+  job.lastOutcome = {
+    kind: 'work-natural-result-missing',
+    reason,
+    attempt: attempts,
+    conversationId: conversationIdFromState(state),
+    oldChatClosed: true,
+    oldChatPreserved: false,
+    sessionEndedWithoutFinalReply: noFinalReply,
+  };
+  resetBrowserResponseState(job);
+  return true;
+}
+
+function handoffPlannerResultToWork(job, report, state) {
+  const nextTask = stripTaskReportContract(report?.next_task || '');
+  if (!nextTask) return false;
+  job.nextTask = stripTaskReportContract(nextTask);
+  job.role = 'work';
+  job.phase = 'work_pending';
+  job.status = 'handoff_to_fresh_chat';
+  job.lastOutcome = {
+    kind: 'planner-next-task',
+    reason: report.status,
+    conversationId: conversationIdFromState(state),
+  };
+  resetBrowserResponseState(job);
+  return true;
+}
+
 async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
   const job = nextBrowserJob(host, jobId);
   if (!job) return null;
@@ -1402,9 +1544,10 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
     // was persisted before a new Browser host was attached.
     job.error = null;
     host.lastBrowserActivityAt = new Date().toISOString();
-    if ((job.phase || 'accepted') === 'accepted') {
+    const phase = job.phase || 'accepted';
+    if (phase === 'accepted' || phase === 'work_pending' || phase === 'planner_pending') {
       let state = await readPageState(host.tab);
-      if ((job.attempt || 0) > 0 || state.url.includes('/c/')) {
+      if (phase !== 'accepted' || (job.attempt || 0) > 0 || state.url.includes('/c/')) {
         await host.tab.goto(host.newChatUrl);
         await sleep(900);
         state = await readPageState(host.tab);
@@ -1436,10 +1579,22 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
         }
         state = await readPageState(host.tab);
       }
-      const sent = await sendGoal(host.tab, promptForGoal(job.goal));
+      const role = phase === 'planner_pending' ? 'planner' : 'work';
+      const sentPrompt = role === 'planner'
+        ? plannerPromptForGoal(job.originalGoal || job.goal, job.workResult, {
+          taskId: job.id,
+          appliedRevision: job.appliedRevision,
+          appliedDigest: job.appliedDigest,
+        })
+        : promptForGoal(job.nextTask || job.goal, { role: 'work' });
+      const sent = await sendGoal(host.tab, sentPrompt);
       if (!sent.ok) throw new Error(sent.errorCode || 'message_send_not_confirmed');
       job.phase = 'waiting';
+      job.role = role;
+      job.dispatchedMessage = sentPrompt;
+      if (role === 'planner') job.plannerConversationId = conversationIdFromState(sent.state);
       job.status = 'running';
+      job.nextTask = role === 'work' ? '' : job.nextTask;
       job.beforeAssistantCount = sent.before.assistantCount;
       job.beforeUserCount = sent.before.userCount;
       job.currentUrl = sent.state.url;
@@ -1448,6 +1603,7 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
       job.lastProgressAt = Date.now();
       job.stableSamples = 0;
       job.lastFingerprint = '';
+      job.noFinalReplySince = null;
       await persistJob(host, job);
       return publicJob(job);
     }
@@ -1476,6 +1632,25 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
     // stale failure after the page is healthy and the card is gone.
     job.authorization = null;
     const responseStarted = state.assistantCount > Number(job.beforeAssistantCount || 0);
+    const userTurnStarted = state.userCount > Number(job.beforeUserCount || 0);
+    // The user bubble is present, but the assistant count never advanced and
+    // the page is already idle. This is a ended-without-final-reply round,
+    // not an empty natural result and never a reason to call the planner.
+    const noFinalReplyCandidate = userTurnStarted
+      && !responseStarted
+      && !state.stopAnswer
+      && !state.pendingAuthorization;
+    if (noFinalReplyCandidate) {
+      if (!job.noFinalReplySince) job.noFinalReplySince = Date.now();
+    } else {
+      job.noFinalReplySince = null;
+    }
+    const noFinalReplyDue = noFinalReplyCandidate
+      && Date.now() - Number(job.noFinalReplySince || Date.now())
+        >= Math.min(
+          DEFAULT_STAGNATION_SECONDS,
+          Math.max(30, Number(host.policy.noFinalReplyTimeout || DEFAULT_NO_FINAL_REPLY_SECONDS)),
+        ) * 1000;
     const fingerprint = `${state.assistantCount}:${state.latestAssistantText.length}:${state.latestAssistantText.slice(-240)}`;
     if (fingerprint !== job.lastFingerprint) {
       job.lastFingerprint = fingerprint;
@@ -1484,32 +1659,79 @@ async function runBrowserStep(host, { jobId = '', allowReattach = true } = {}) {
     } else {
       job.stableSamples = Number(job.stableSamples || 0) + 1;
     }
-    if (!state.stopAnswer && responseStarted && job.stableSamples >= 3) {
-      const completion = classifyCompletion(state.latestAssistantText || state.bodyText);
-      if (completion.valid) {
+    if (noFinalReplyDue) {
+      if (job.role === 'work') {
+        retryWorkWithoutNaturalResult(job, state, host.policy, 'no-final-reply');
+      } else {
+        const attempts = Number(job.noFinalReplyAttempts || 0) + 1;
+        job.noFinalReplyAttempts = attempts;
+        const configuredMaxAttempts = Number(host.policy.maxRecoveryAttempts);
+        const maxAttempts = Number.isFinite(configuredMaxAttempts)
+          ? Math.max(0, configuredMaxAttempts) : 5;
+        if (attempts > maxAttempts) {
+          job.status = 'failed';
+          job.phase = 'terminal';
+          job.error = '规划 Chat 会话已结束但没有最终回执；插件已用新规划 Chat 重试并用尽次数。';
+          job.lastOutcome = {
+            kind: 'planner-report-missing',
+            reason: 'no-final-reply-exhausted',
+            attempt: attempts,
+            conversationId: conversationIdFromState(state),
+            sessionEndedWithoutFinalReply: true,
+          };
+        } else {
+          job.status = 'handoff_to_fresh_chat';
+          job.phase = 'planner_pending';
+          job.lastOutcome = {
+            kind: 'planner-report-missing',
+            reason: 'no-final-reply',
+            attempt: attempts,
+            conversationId: conversationIdFromState(state),
+            oldChatClosed: true,
+            oldChatPreserved: false,
+            sessionEndedWithoutFinalReply: true,
+          };
+          resetBrowserResponseState(job);
+        }
+      }
+    } else if (!state.stopAnswer && responseStarted && job.stableSamples >= 3) {
+      const completion = job.role === 'planner'
+        ? classifyPlannerResult(state.latestAssistantText || state.bodyText)
+        : classifyWorkResult(state.latestAssistantText);
+      if (job.role === 'planner' && completion.report?.complete) {
         job.status = 'completed';
         job.phase = 'terminal';
         job.lastOutcome = {
-          kind: 'complete', mode: completion.mode, conversationId: conversationIdFromState(state),
+          kind: 'planner-complete', mode: completion.mode, conversationId: conversationIdFromState(state),
         };
-        if (completion.certificate?.payload) job.certificate = completion.certificate.payload;
-      } else {
+        job.certificate = completion.report.payload;
+      } else if (job.role === 'planner' && completion.report?.actionable) {
+        handoffPlannerResultToWork(job, completion.report.payload, state);
+      } else if (job.role === 'planner') {
         job.status = 'handoff_to_fresh_chat';
-        job.phase = 'accepted';
-        job.attempt = Number(job.attempt || 0) + 1;
+        job.phase = 'planner_pending';
         job.lastOutcome = {
-          kind: 'incomplete', reason: completion.reason, conversationId: conversationIdFromState(state),
+          kind: 'planner-report-missing', reason: completion.reason,
+          conversationId: conversationIdFromState(state),
         };
-        job.beforeAssistantCount = 0;
-        job.beforeUserCount = 0;
-        job.stableSamples = 0;
-        job.lastFingerprint = '';
+        resetBrowserResponseState(job);
+      } else if (completion.valid) {
+        job.emptyWorkResultAttempts = 0;
+        handoffWorkResultToPlanner(job, state);
+      } else if (completion.reason === 'empty-natural-result') {
+        retryWorkWithoutNaturalResult(job, state, host.policy);
+      } else {
+        handoffWorkResultToPlanner(job, state, completion.reason);
       }
     } else if (Date.now() - Number(job.lastProgressAt || Date.now()) >= DEFAULT_STAGNATION_SECONDS * 1000) {
-      job.status = 'handoff_to_fresh_chat';
-      job.phase = 'accepted';
-      job.attempt = Number(job.attempt || 0) + 1;
-      job.lastOutcome = { kind: 'stagnated', conversationId: conversationIdFromState(state) };
+      if (job.role === 'planner') {
+        job.status = 'handoff_to_fresh_chat';
+        job.phase = 'planner_pending';
+        job.lastOutcome = { kind: 'planner-stagnated', conversationId: conversationIdFromState(state) };
+        resetBrowserResponseState(job);
+      } else {
+        retryWorkWithoutNaturalResult(job, state, host.policy);
+      }
     } else {
       job.status = state.stopAnswer ? 'running' : (responseStarted ? 'settling' : 'starting');
     }
@@ -1552,6 +1774,13 @@ function publicJob(job) {
   return {
     id: job.id,
     goal: job.goal,
+    originalGoal: job.originalGoal || job.goal,
+    nextTask: job.nextTask || '',
+    workResult: job.workResult || '',
+    role: job.role || 'work',
+    dispatchedMessage: job.dispatchedMessage || '',
+    plannerConversationId: job.plannerConversationId || null,
+    certificate: job.certificate || null,
     status: job.status,
     attempt: job.attempt,
     startedAt: job.startedAt,
@@ -1564,6 +1793,9 @@ function publicJob(job) {
     latestReply: job.latestReply || '',
     lastOutcome: job.lastOutcome || null,
     error: job.error || null,
+    emptyWorkResultAttempts: job.emptyWorkResultAttempts || 0,
+    noFinalReplyAttempts: job.noFinalReplyAttempts || 0,
+    noFinalReplySince: job.noFinalReplySince || null,
     reattachCount: job.reattachCount || 0,
     lastReattachedAt: job.lastReattachedAt || null,
     lastReattachMethod: job.lastReattachMethod || null,
@@ -1574,72 +1806,14 @@ function publicJob(job) {
 }
 
 async function runJob(host, job) {
-  job.status = 'running';
-  job.updatedAt = new Date().toISOString();
-  const newChatUrl = host.newChatUrl;
-  try {
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-      if (job.stopRequested) {
-        job.status = 'stopped';
-        break;
-      }
-      job.attempt = attempt;
-      job.authorization = null;
-      job.updatedAt = new Date().toISOString();
-      let state = await readPageState(host.tab);
-      const mustCreateFreshChat = attempt > 1 || state.url.includes('/c/');
-      if (mustCreateFreshChat) {
-        await host.tab.goto(newChatUrl);
-        await sleep(1200);
-      }
-      state = await ensureChatPage(host.tab, newChatUrl, host);
-      job.currentUrl = state.url;
-      job.conversationId = conversationIdFromState(state);
-      const prompt = promptForGoal(job.goal);
-      const sent = await sendGoal(host.tab, prompt);
-      if (!sent.ok) throw new Error(sent.errorCode || 'message_send_not_confirmed');
-      job.currentUrl = sent.state.url;
-      job.conversationId = conversationIdFromState(sent.state);
-      job.status = 'running';
-      job.updatedAt = new Date().toISOString();
-      const outcome = await waitForResponse(host.tab, job, sent.before, host.policy);
-      job.lastOutcome = { kind: outcome.kind, conversationId: conversationIdFromState(outcome.state) };
-      job.updatedAt = new Date().toISOString();
-      if (outcome.kind === 'complete') {
-        job.status = 'completed';
-        if (outcome.completion?.certificate?.payload) {
-          job.certificate = outcome.completion.certificate.payload;
-        }
-        break;
-      }
-      if (outcome.kind === 'stopped') {
-        job.status = 'stopped';
-        break;
-      }
-      if (outcome.kind === 'blocked') {
-        job.status = 'waiting_for_authorization';
-        job.error = outcome.approval?.message || '等待“允许本次会话”授权';
-        break;
-      }
-      if (outcome.kind === 'incomplete' || outcome.kind === 'stagnated' || outcome.kind === 'timed-out') {
-        job.status = 'handoff_to_fresh_chat';
-        continue;
-      }
-      throw new Error(`未处理的 Chat 结果：${outcome.kind}`);
-    }
-    if (job.status === 'handoff_to_fresh_chat') {
-      job.status = 'failed';
-      job.error = '达到安全的最大新 Chat 续作次数';
-    }
-  } catch (error) {
-    job.status = job.stopRequested ? 'stopped' : 'failed';
-    job.error = publicError(error);
-  } finally {
-    job.updatedAt = new Date().toISOString();
-    if (host.activeJob?.id === job.id && TERMINAL_JOB_STATUSES.has(job.status)) {
-      host.activeJob = job;
+  while (!TERMINAL_JOB_STATUSES.has(job.status) && !job.stopRequested) {
+    await runBrowserStep(host, { jobId: job.id });
+    if (job.phase === 'waiting' || job.status === 'waiting_for_authorization') {
+      await sleep(Math.min(5_000, Math.max(200, Number(host.policy.pollIntervalMs || 500))));
     }
   }
+  if (job.stopRequested && !TERMINAL_JOB_STATUSES.has(job.status)) job.status = 'stopped';
+  await persistJob(host, job);
 }
 
 function safeEqual(left, right) {
@@ -1679,6 +1853,11 @@ async function capabilityStatus(host) {
     ok: true,
     capability: BROWSER_CAPABILITY,
     browser: 'iab',
+    replyHandoffAvailable: handoffAvailable(host.localWorkBridge),
+    localWorkBridge: typeof host.localWorkBridge?.status === 'function'
+      ? host.localWorkBridge.status() : null,
+    replyHandoffWatches: typeof host.replyHandoff?.list === 'function'
+      ? host.replyHandoff.list() : [],
     model: BROWSER_MODEL,
     reasoning: BROWSER_REASONING,
     surface: 'chat',
@@ -1706,6 +1885,7 @@ export async function createInAppBrowserCapabilityHost({
   jobStateFile = DEFAULT_JOB_FILE,
   logger = () => {},
   recoverTab = reattachInAppBrowserTab,
+  localWorkBridge = undefined,
 } = {}) {
   if (!browser || !tab?.playwright) throw new Error('需要已授权的内置 Browser 和可控标签页');
   const policyCheck = validateBrowserPolicy(policy);
@@ -1713,9 +1893,21 @@ export async function createInAppBrowserCapabilityHost({
   const token = randomBytes(32).toString('base64url');
   const resolvedCapabilityFile = resolve(capabilityFile);
   const initialUrl = startUrl || await tab.playwright.evaluate(() => window.location.href);
+  const resolvedLocalWorkBridge = localWorkBridge === undefined
+    ? createLocalWorkBridge({
+      stateFile: `${resolve(jobStateFile)}.work-bridge.json`,
+      logger,
+    })
+    : localWorkBridge;
   const host = {
     browser,
     tab,
+    // The explicit adapter remains authoritative. When no adapter is supplied,
+    // the bundled local bridge uses the supported Codex queue/app-server entry
+    // point. It survives the web model's turn because the queued Work message
+    // is accepted by a separate local process and durably deduplicated by event
+    // id.
+    localWorkBridge: resolvedLocalWorkBridge,
     logger,
     recoverTab,
     policy: { ...BROWSER_DISPATCH_POLICY },
@@ -1737,6 +1929,17 @@ export async function createInAppBrowserCapabilityHost({
     pageRefreshWindowStartedAt: Date.now(),
     lastPageRefreshAt: 0,
   };
+  host.replyHandoff = new ReplyHandoff({
+    stateFile: `${host.jobStateFile}.reply-handoff.json`,
+    bridge: host.localWorkBridge,
+    readSnapshot: async watch => {
+      // Never navigate/recreate a tab or read another conversation on its behalf.
+      const watchedTab = await browser.tabs.get(watch.tabId);
+      const state = await readPageState(watchedTab);
+      return { ...state, pageError: isPageLoadFailureState(state) };
+    },
+  });
+  await host.replyHandoff.restore();
   const restoredJobs = await restoreJobs(host.jobStateFile);
   for (const job of restoredJobs) registerJob(host, job);
   host.activeJob = restoredJobs[0] || null;
@@ -1900,6 +2103,29 @@ export async function createInAppBrowserCapabilityHost({
         json(res, 200, await capabilityStatus(host));
         return;
       }
+      if (requestUrl.pathname === '/v1/reply-handoff' && req.method === 'POST') {
+        if (!handoffAvailable(host.localWorkBridge)) {
+          json(res, 503, { ok: false, errorCode: 'independent_work_bridge_unavailable',
+            message: '宿主未提供跨模型回合持续运行、绑定本地 Work 并去重确认的通知接口。不能交还等待。' });
+          return;
+        }
+        const body = await requestBody(req);
+        let result;
+        if (body.action === 'register') {
+          if (activeBrowserJobs(host).some(job => job.tabId === body.tabId)) {
+            json(res, 409, { ok: false, errorCode: 'tab_owned_by_goal_dispatcher' });
+            return;
+          }
+          result = await host.replyHandoff.register(body);
+        } else if (body.action === 'cancel') result = await host.replyHandoff.cancel(body.watchId);
+        else if (body.action === 'status') result = host.replyHandoff.status(body.watchId);
+        else if (body.action === 'tick') result = {
+          watches: await host.replyHandoff.tick(),
+        };
+        else throw new Error('invalid_handoff_action');
+        json(res, 200, { ok: true, ...result });
+        return;
+      }
       const jobMatch = requestUrl.pathname.match(/^\/v1\/chat\/jobs\/([^/]+)(\/stop)?$/u);
       if (req.method === 'GET' && jobMatch) {
         const job = jobForId(host, jobMatch[1]);
@@ -1940,6 +2166,15 @@ export async function createInAppBrowserCapabilityHost({
         const job = {
           id: `iab_${randomUUID()}`,
           goal,
+          originalGoal: goal,
+          nextTask: goal,
+          workResult: '',
+          role: 'work',
+          dispatchedMessage: '',
+          plannerConversationId: null,
+          appliedRevision: Number.isInteger(body.appliedRevision) ? body.appliedRevision : null,
+          appliedDigest: body.appliedDigest ? String(body.appliedDigest).slice(0, 256) : null,
+          certificate: null,
           status: 'accepted',
           attempt: 0,
           startedAt: new Date().toISOString(),
@@ -1949,6 +2184,7 @@ export async function createInAppBrowserCapabilityHost({
           conversationId: null,
           latestReply: '',
           responseRunning: false,
+          emptyWorkResultAttempts: 0,
           authorization: null,
           lastOutcome: null,
           error: null,
@@ -2027,9 +2263,24 @@ export async function createInAppBrowserCapabilityHost({
   host.descriptor = { ...descriptor, token: undefined };
   host.server = server;
   let released = false;
+  let handoffTimer;
+  // A process callback polls; the model is never invoked for unchanged state.
+  // The independent lifetime declaration is supplied only by a trusted host.
+  const handoffTick = async () => {
+    if (released || Date.now() >= host.expiresAt) return;
+    try { await host.replyHandoff.tick(); }
+    catch { host.logger({ event: 'handoff_state_unavailable' }); }
+    if (!released) handoffTimer = setTimeout(handoffTick, 1000);
+  };
+  if (handoffAvailable(host.localWorkBridge)
+      && host.localWorkBridge.serverSupervised === false) {
+    handoffTimer = setTimeout(handoffTick, 1000);
+  }
   host.release = async () => {
     if (released) return;
     released = true;
+    clearTimeout(handoffTimer);
+    await host.replyHandoff.tail;
     host.pumpStopRequested = true;
     for (const waiter of host.jobWaiters.splice(0)) waiter(null);
     await new Promise(resolvePromise => server.close(() => resolvePromise()));
@@ -2069,6 +2320,7 @@ export async function attachPersistentInAppBrowserCapabilityHost({
   jobStateFile = DEFAULT_JOB_FILE,
   logger = () => {},
   recoverTab = reattachInAppBrowserTab,
+  localWorkBridge = undefined,
 } = {}) {
   const recovery = await recoverTab({
     browser,
@@ -2086,6 +2338,7 @@ export async function attachPersistentInAppBrowserCapabilityHost({
     jobStateFile,
     logger,
     recoverTab,
+    localWorkBridge,
   });
   host.bootstrapReattachMethod = recovery.method;
   return host;

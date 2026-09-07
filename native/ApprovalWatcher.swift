@@ -25,7 +25,9 @@ func decide(
 }
 
 func scan(_ state: inout PluginState) -> [String: Any] {
-  // Hidden renderers are handled through IPC without route or focus changes.
+  // Plugin-owned renderers are handled through IPC without route or focus
+  // changes. The same exact target may be visible or hidden; visibility is
+  // reported, while ownership and Chat-surface validation remain mandatory.
   // AX is only a compatibility path for a genuinely visible approval card in
   // the active ChatGPT window. It must never press virtualized elements that
   // belong to a conversation the user has already left.
@@ -35,15 +37,25 @@ func scan(_ state: inout PluginState) -> [String: Any] {
   let ipcPending = ipcResult?["pending"] as? Int ?? 0
   let ipcBlocked = ipcResult?["blocked"] as? Int ?? 0
   let ipcUnmatched = ipcResult?["unmatched"] as? Int ?? 0
+  let runtimeState = pluginBackgroundRuntimeState(state)
+  let backgroundOnly = runtimeState == .hidden
+  let runtimeName = runtimeState.map(queueTargetRuntimeStateName)
   let visibleAXEnabled = ProcessInfo.processInfo.environment[
     "CHATGPT_AUTO_CONFIRM_ALLOW_VISIBLE_AX"
   ] == "1"
   if !visibleAXEnabled {
-    if let ipcResult { return ipcResult }
+    if var ipcResult {
+      ipcResult["backgroundOnly"] = backgroundOnly
+      ipcResult["runtimeState"] = runtimeName as Any
+      ipcResult["visibleRendererAccess"] = runtimeState == .visible
+      return ipcResult
+    }
     state.lastError = nil
     return [
       "ok": true, "candidates": 0, "approved": 0, "pending": 0,
-      "blocked": 0, "unmatched": 0, "backgroundOnly": true,
+      "blocked": 0, "unmatched": 0, "backgroundOnly": backgroundOnly,
+      "runtimeState": runtimeName as Any,
+      "visibleRendererAccess": runtimeState == .visible,
       "pageChanged": false, "visibleFallbackDisabled": true,
     ]
   }
@@ -121,7 +133,8 @@ func scan(_ state: inout PluginState) -> [String: Any] {
     "unmatched": ipcUnmatched + unmatched,
     "hiddenCandidates": ipcCandidates, "hiddenApproved": ipcApproved,
     "windowCandidates": found.count, "windowApproved": approved,
-    "backgroundOnly": true, "pageChanged": false,
+    "backgroundOnly": backgroundOnly, "runtimeState": runtimeName as Any,
+    "visibleRendererAccess": runtimeState == .visible, "pageChanged": false,
   ]
 }
 
@@ -199,6 +212,10 @@ func statusPayload(_ state: PluginState) -> [String: Any] {
   }
   let approvalTargets = loadedApprovalTargets(state)
   let approvalPorts = Array(Set(approvalTargets.map(\.port))).sorted()
+  let runtimeState = pluginBackgroundRuntimeState(state)
+  let runtimeName = runtimeState.map(queueTargetRuntimeStateName)
+  let isHidden = runtimeState == .hidden
+  let isVisible = runtimeState == .visible
   return [
     "ok": true,
     "running": state.enabled && watcherIsAlive(state.watcherPid),
@@ -209,7 +226,8 @@ func statusPayload(_ state: PluginState) -> [String: Any] {
     "rules": rulePayload,
     "chatTitles": state.chatTitles ?? [],
     "trackedChatURLs": state.trackedChatURLs ?? [],
-    "hiddenTargetCount": approvalTargets.count,
+    "hiddenTargetCount": isHidden ? approvalTargets.count : 0,
+    "visibleTargetCount": isVisible ? approvalTargets.count : 0,
     "loadedRendererCount": approvalTargets.count,
     "scannedPorts": approvalPorts,
     "backgroundChat": [
@@ -217,16 +235,22 @@ func statusPayload(_ state: PluginState) -> [String: Any] {
       "targetId": state.backgroundChatTargetId as Any,
       "profilePath": state.backgroundProfilePath as Any,
       "conversationId": state.backgroundConversationId as Any,
-      "connected": state.backgroundAppPort.map {
-        !CDPClient.fetchTargets(portOverride: $0).isEmpty
+      "connected": state.backgroundAppPort.flatMap { port in
+        state.backgroundChatTargetId.map { targetId in
+          CDPClient.fetchTargets(portOverride: port).contains {
+            $0["id"] as? String == targetId
+          }
+        }
       } ?? false,
       "surface": "chat",
+      "runtimeState": runtimeName as Any,
       "workerUsed": false,
     ],
     "intervalMs": state.intervalMs,
     "auditCount": state.audit.count,
     "lastError": state.lastError as Any,
-    "backgroundOnly": true,
+    "backgroundOnly": isHidden,
+    "runtimeState": runtimeName as Any,
     "ipc": [
       "cdp": CDPClient.checkStatus(),
       "unix": UnixIPCClient.checkStatus(),
@@ -245,9 +269,10 @@ func statusPayload(_ state: PluginState) -> [String: Any] {
       "dismissesCoveringHistoryOverlay": true,
       "ipcIsPrimaryPath": true,
       "internalActionIsPrimary": true,
-      "operatesHiddenPages": true,
+      "operatesHiddenPages": isHidden,
       "scansEveryLoadedRenderer": false,
-      "visibleRendererAccess": false,
+      "visibleRendererAccess": isVisible && queueAllowsVisibleDedicatedRenderer(),
+      "operatesVisiblePluginPages": isVisible && queueAllowsVisibleDedicatedRenderer(),
       "requiresPriorTracking": false,
       "changesVisiblePage": false,
       "axPressIsFallback": ProcessInfo.processInfo.environment[

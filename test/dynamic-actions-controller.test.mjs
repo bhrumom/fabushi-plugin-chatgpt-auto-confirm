@@ -81,14 +81,16 @@ test('unchanged terminal tasks preserve the child controller recovery budget', (
   );
 });
 
-test('every dispatched work Chat receives only the final completion certificate', () => {
-  assert.match(controller, /MAHAYANA_TASK_REPORT_CONTRACT_V5/);
-  assert.match(controller, /"status":"complete"/);
-  assert.match(controller, /"all_tasks_complete":true/);
-  assert.doesNotMatch(controller, /"status":"incomplete"/);
-  assert.doesNotMatch(controller, /"all_tasks_complete":false/);
+test('Work Chat stays natural while a fresh planner Chat owns the report protocol', () => {
+  assert.match(controller, /const workDispatchBoundary =/);
+  assert.match(controller, /工作 Chat/);
+  assert.match(controller, /自然语言工作结果/);
+  assert.match(controller, /新的规划\/验收 Chat/);
+  assert.match(controller, /只有规划\/验收 Chat 才负责固定回执/);
+  assert.match(controller, /next_task 原文交给下一轮新的工作 Chat/);
+  assert.doesNotMatch(controller, /MAHAYANA_TASK_REPORT_CONTRACT_V5/);
+  assert.doesNotMatch(controller, /MAHAYANA_TASK_REPORT_V1_BEGIN/);
   assert.doesNotMatch(controller, /MAHAYANA_TASK_WAIT_V1/);
-  assert.match(controller, /"task_id":\$\{taskId\}/);
   assert.doesNotMatch(controller, /Gmail|项目邮件|立项邮件/);
   assert.match(controller, /小程序会把同一目标发送到新的 Chat/);
 });

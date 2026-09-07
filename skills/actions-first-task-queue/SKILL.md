@@ -5,7 +5,7 @@ description: "Run long-lived coding, release, deployment, or plugin-marketplace 
 
 # Continuous Task Queue
 
-Use `chatgpt-auto-confirm` as the controller. Work only in queue-owned **Chat** conversations, never Work. GitHub repository state is authoritative. An unchanged task continues from its persisted repository progress; an updated goal starts a fresh Chat with the updated repository project definition.
+Use `chatgpt-auto-confirm` as the controller. Work only in queue-owned **Chat** conversations, never the visible Work composer. Each execution round is a fresh work Chat; its natural result is handed to a fresh planner/acceptance Chat, which alone emits the report envelope and determines the next `next_task`. GitHub repository state is authoritative. An unchanged task continues from its persisted repository progress; an updated goal starts a fresh Chat with the updated repository project definition.
 
 ## What every round must do
 
@@ -51,7 +51,7 @@ Do not repeat the same failed command or connector path. Diagnose the cause firs
 
 Do not stop merely because an operation is slow. Poll Actions, deployments, releases, and remote checks inside the same Chat whenever possible. Do not stop while useful work can continue.
 
-There is exactly one report envelope, and it is a completion certificate. Emit it only when the entire repository project, all acceptance checks, required tests, releases, and evidence are complete. The queue stops only when `status=complete` and `all_tasks_complete=true`, with empty `remaining` and `blockers`.
+There is exactly one report envelope, and only a fresh planner/acceptance Chat may receive or emit it. A work Chat must return a natural-language result and must not receive a completion, incomplete, blocked, or next-step template. The planner receives the original goal and that natural result, inspects the repository state, and emits the envelope: it may set `status=complete` only when the entire repository project, all acceptance checks, required tests, releases, and evidence are complete; otherwise it writes the next executable arrangement into `next_task`. The queue stops only when `status=complete` and `all_tasks_complete=true`, with empty `remaining` and `blockers`.
 
 ```text
 MAHAYANA_TASK_REPORT_V1_BEGIN
@@ -59,11 +59,11 @@ MAHAYANA_TASK_REPORT_V1_BEGIN
 MAHAYANA_TASK_REPORT_V1_END
 ```
 
-If the Chat is unfinished, waiting, blocked, ends early, or omits a valid completion certificate, emit no report template. The miniapp must preserve the repository state and send the same goal to a fresh Chat. There is no separate incomplete, blocked, waiting, next-step, Gmail, project-email, countdown, or legacy timed-task protocol in the prompt.
+If the work Chat is unfinished, waiting, blocked, ends early, or omits a natural result, emit no report template. The plugin closes the exact old plugin-owned Chat when retrying, preserves the repository state, and sends the same goal to a fresh work Chat. If the planner is incomplete or blocked, the plugin sends only its raw `next_task` to a fresh work Chat. There is no separate incomplete, blocked, waiting, next-step, Gmail, project-email, countdown, or legacy timed-task protocol in a work prompt.
 
 ## Recover safely
 
-Treat a Chat that shows no assistant or tool activity shortly after a verified send as a renderer failure, not as a long-running build. Restart only the queue-owned hidden ChatGPT process and continue from the persisted checkout in a new Chat.
+Treat a Chat that shows no assistant or tool activity shortly after a verified send as a renderer failure, not as a long-running build. Close and restart only the exact queue-owned plugin ChatGPT target/profile/process (whether visible or hidden) and continue from the persisted checkout in a new Chat.
 
 Treat visible GitHub Actions or deployment progress as active work. Do not declare completion merely because a Chat stopped. A fast unfinished reply is backed off before another branch is sent so the queue cannot spin or trigger rate limits.
 
@@ -73,7 +73,7 @@ The task id is stable and the task definition is versioned state. Define `revisi
 
 - Increment `revision` whenever possible. If file content or the goal changes without a revision bump, the miniapp still creates an internal next revision from the changed digest.
 - Use `applyMode: "next_chat"` by default; the current Chat may finish its turn, but its result cannot complete the task after a newer revision exists.
-- Use `applyMode: "interrupt"` only for urgent safety or architecture corrections. The queue stops only its hidden task-owned response, preserves the checkout, and immediately creates a fresh Chat on the new revision.
+- Use `applyMode: "interrupt"` only for urgent safety or architecture corrections. The queue stops only its plugin-owned task response, preserves the checkout, and immediately creates a fresh Chat on the new revision.
 - Current prompts, directives, specification digests, sources, and the last 100 updates are versioned in queue state.
 - An unchanged second-or-later round stays on its branch and receives only the short continuation instruction.
 - A changed prompt or digest clears the old branch identity. The next Chat is a true first round containing the complete updated goal and configured task locations, if any. It must not create an email unless human intervention is required.
